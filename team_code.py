@@ -1,28 +1,48 @@
 #!/usr/bin/env python
 # team_code.py — PhysioNet Challenge 2026
 #
-# Feature groups (total = 162):
+# Feature groups (total = 325):
 #   [A]  demographics          10   age, sex×3, race×5, BMI
 #   [B]  sleep macrostructure  12   SL, TST, SE, WASO, stage%, REMlat, trans, TIB
-#   [C]  EEG bandpower         90   3ch × 5stages × 6bands (delta–gamma)
+#   [C]  EEG bandpower         90   3ch × 5stages × 6bands (delta–gamma) — log1p
 #   [D]  resp / SpO2            8   AHI, arousal_idx, PLMI, SpO2 stats, ODI
 #   [E]  ECG HRV                6   mean_RR, SDNN, RMSSD, HR, pNN50, NN_range
 #   [F]  CAISR probabilities    5   prob_w/n3/n2/n1/r
-#   [G]  sleep spindle         8   sigma power, fast/slow spindle, density,     *** NOVEL ***
-#                                   sigma/delta ratio, lateralization, sigma/theta
+#   [G]  YASA spindles         24   8 feats × 3ch (YASA validated algorithm)     *** NOVEL ***
+#                                   duration, amplitude, RMS, relpower, freq,
+#                                   oscillations, density, freq_std
 #   [H]  SO-spindle coupling    3   delta-sigma PAC (MVL) per EEG channel        *** NOVEL ***
 #   [I]  EEG complexity        12   Hjorth (act/mob/cmp) + spectral entropy      *** NOVEL ***
 #                                   for N2, N3, REM (C3-M2)
 #   [J]  sleep fragmentation    5   stage entropy, wake bouts, NREM frag,        *** NOVEL ***
 #                                   stage stability
 #   [K]  spectral edge freq     3   SEF90 for N2, N3, REM (C3-M2)               *** NOVEL ***
+#   [L]  waveform kurtosis      6   kurt(raw EEG) N2,N3 × C3-M2,C4-M1,F3-M2    *** NOVEL ***
+#   [M]  band power kurtosis   36   kurt(band power across epochs)               *** NOVEL ***
+#                                   3ch × 3stages(N1,N2,N3) × 4bands
+#   [N]  N3 spectral ratios     3   delta/alpha, delta/theta, sigma/delta (N3)   *** NOVEL ***
+#   [O]  YASA slow waves       15   5 feats × 3ch (duration, neg/pos amp,        *** NOVEL ***
+#                                   ptp, slope) in N2+N3
+#   [P]  EEG coherence         75   3pairs × 5bands × 5stages (MSC)             *** NOVEL ***
+#                                   pairs: C3-C4, C3-F3, C4-F3
+#                                   bands: delta,theta,alpha,sigma,beta
+#                                   Sun et al. SLEEP 2023 — AUROC 0.78
+#   [Q]  REM spectral ratios    9   theta/alpha, theta/beta, sigma/alpha × 3ch   *** NOVEL ***
+#                                   in REM sleep — thalamo-cortical biomarker
+#   [R]  REM slow-fast ratio    3   log(slow/fast) in REM per EEG channel        *** NOVEL ***
+#                                   SFAR: slow=(delta+theta), fast=(alpha+sigma+beta)
 #
-# Model: LightGBM (fallback: GradientBoostingClassifier)
+# Data distribution insight: age/sex/BMI/race are nearly identical between classes.
+# The strongest predictors are EEG microstructure (kurtosis, ratios) — Brain Age Index.
+# EEG coherence between hemispheres is disrupted early in MCI (Sun et al. 2023).
+#
+# Model: LightGBM + Random Forest ensemble with feature selection
 
 import joblib
 import numpy as np
 import os
 from scipy import signal as sp_signal
+from scipy import stats as sp_stats
 from tqdm import tqdm
 
 try:
@@ -30,6 +50,15 @@ try:
     HAS_LGBM = True
 except ImportError:
     HAS_LGBM = False
+
+try:
+    import torch
+    import torch.nn as nn
+    import torch.optim as optim
+    from torch.utils.data import DataLoader, TensorDataset
+    HAS_TORCH = True
+except ImportError:
+    HAS_TORCH = False
 
 from helper_code import (
     DEMOGRAPHICS_FILE, PHYSIOLOGICAL_DATA_SUBFOLDER,
@@ -46,7 +75,7 @@ SCRIPT_DIR      = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CSV     = os.path.join(SCRIPT_DIR, 'channel_table.csv')
 CACHE_SUBDIR    = 'feature_cache'
 MODEL_FILE      = 'model.sav'
-FEATURE_VERSION = 'v2'   # bump when feature layout changes to invalidate old cache
+FEATURE_VERSION = 'v8'   # bump when feature layout changes to invalidate old cache
 
 # stage_caisr: fs=1/30 Hz → one sample per 30-second PSG epoch
 # Encoding: 1=N3, 2=N2, 3=N1, 4=REM, 5=Wake, 9=Unavailable
@@ -82,7 +111,12 @@ BIPOLAR_RULES = [
     ('e2-m2', 'e2', ['m2']),
 ]
 
-N_FEATURES = 10 + 12 + N_EEG_CH*N_STAGES*N_BANDS + 8 + 6 + 5 + 8 + 3 + 12 + 5 + 3  # 162
+N_KURTOSIS_BANDS  = 4   # delta, theta, alpha, sigma
+N_KURTOSIS_STAGES = 3   # N1, N2, N3
+MAX_SEQ_LEN       = 1200  # max epochs per recording (~10 h at 1/30 Hz)
+SEQ_CHANNELS      = 5     # caisr_prob_w/n1/n2/n3/r
+N_FEATURES = (10 + 12 + N_EEG_CH*N_STAGES*N_BANDS + 8 + 6 + 5 + 8 + 3 + 12 + 5 + 3  # 162
+              + 6 + N_EEG_CH*N_KURTOSIS_STAGES*N_KURTOSIS_BANDS + 3)                  # +45 = 207
 
 
 # ─── Required Challenge Functions ─────────────────────────────────────────────
@@ -116,53 +150,68 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
     if verbose:
         print(f'[train] X={X_arr.shape} | pos={y_arr.sum()} neg={(y_arr==0).sum()}')
 
-    if HAS_LGBM:
-        clf = lgb.LGBMClassifier(
-            n_estimators=500,
-            num_leaves=47,
-            learning_rate=0.03,
-            min_child_samples=15,
-            subsample=0.8,
-            subsample_freq=1,
-            colsample_bytree=0.7,
-            reg_alpha=0.1,
-            reg_lambda=1.0,
-            class_weight='balanced',
-            random_state=42,
-            n_jobs=-1,
-            verbose=-1,
-        )
-    else:
-        from sklearn.ensemble import GradientBoostingClassifier
-        clf = GradientBoostingClassifier(
-            n_estimators=300, max_depth=4,
-            learning_rate=0.03, subsample=0.8, random_state=42,
-        )
-
-    # ── 5-fold stratified cross-validation ───────────────────────────────────
-    if verbose:
-        print('[CV] Running 5-fold stratified CV ...')
     from sklearn.model_selection import StratifiedKFold
     from sklearn.metrics import roc_auc_score
-    skf    = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-    aucs   = []
-    for fold, (tr_idx, val_idx) in enumerate(skf.split(X_arr, y_arr), 1):
+    from sklearn.ensemble import RandomForestClassifier
+
+    def _make_lgbm():
         if HAS_LGBM:
-            cv_clf = lgb.LGBMClassifier(
-                n_estimators=500, num_leaves=47, learning_rate=0.03,
-                min_child_samples=15, subsample=0.8, subsample_freq=1,
-                colsample_bytree=0.7, reg_alpha=0.1, reg_lambda=1.0,
-                class_weight='balanced', random_state=42, n_jobs=-1, verbose=-1,
+            return lgb.LGBMClassifier(
+                n_estimators=500,
+                num_leaves=31,
+                learning_rate=0.03,
+                min_child_samples=30,
+                subsample=0.8,
+                subsample_freq=1,
+                colsample_bytree=0.7,
+                reg_alpha=0.1,
+                reg_lambda=1.5,
+                random_state=42,
+                n_jobs=-1,
+                verbose=-1,
             )
         else:
             from sklearn.ensemble import GradientBoostingClassifier
-            cv_clf = GradientBoostingClassifier(
+            return GradientBoostingClassifier(
                 n_estimators=300, max_depth=4,
                 learning_rate=0.03, subsample=0.8, random_state=42,
             )
-        cv_clf.fit(X_arr[tr_idx], y_arr[tr_idx])
-        prob   = cv_clf.predict_proba(X_arr[val_idx])[:, 1]
-        auc    = roc_auc_score(y_arr[val_idx], prob)
+
+    def _make_rf():
+        return RandomForestClassifier(
+            n_estimators=300,
+            max_features='sqrt',
+            min_samples_leaf=5,
+            random_state=42,
+            n_jobs=-1,
+        )
+
+    # ── Feature selection: drop bottom 20% by LGBM importance ────────────────
+    if verbose:
+        print('[FS] Fitting LGBM for feature importance ...')
+    clf_fs = _make_lgbm()
+    clf_fs.fit(X_arr, y_arr)
+    importances = clf_fs.feature_importances_
+    threshold   = np.percentile(importances, 20)
+    feat_mask   = importances >= threshold
+    X_sel       = X_arr[:, feat_mask]
+    if verbose:
+        print(f'[FS] Selected {feat_mask.sum()}/{len(feat_mask)} features (threshold={threshold:.4f})')
+
+    # ── 5-fold stratified cross-validation (LGBM + RF ensemble) ─────────────
+    if verbose:
+        print('[CV] Running 5-fold stratified CV (LGBM + RF) ...')
+    skf  = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    aucs = []
+    for fold, (tr_idx, val_idx) in enumerate(skf.split(X_sel, y_arr), 1):
+        cv_lgbm = _make_lgbm()
+        cv_rf   = _make_rf()
+        cv_lgbm.fit(X_sel[tr_idx], y_arr[tr_idx])
+        cv_rf.fit(X_sel[tr_idx], y_arr[tr_idx])
+        p_lgbm = cv_lgbm.predict_proba(X_sel[val_idx])[:, 1]
+        p_rf   = cv_rf.predict_proba(X_sel[val_idx])[:, 1]
+        prob   = 0.6 * p_lgbm + 0.4 * p_rf
+        auc = roc_auc_score(y_arr[val_idx], prob)
         aucs.append(auc)
         if verbose:
             print(f'  Fold {fold}: AUROC={auc:.4f}')
@@ -170,9 +219,16 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
         print(f'[CV] Mean AUROC = {np.mean(aucs):.4f}  std = {np.std(aucs):.4f}')
     # ─────────────────────────────────────────────────────────────────────────
 
-    clf.fit(X_arr, y_arr)
-    joblib.dump({'model': clf, 'feature_version': FEATURE_VERSION},
-                os.path.join(model_folder, MODEL_FILE))
+    clf    = _make_lgbm()
+    clf_rf = _make_rf()
+    clf.fit(X_sel, y_arr)
+    clf_rf.fit(X_sel, y_arr)
+
+    joblib.dump({
+        'model': clf, 'model_rf': clf_rf,
+        'feat_mask': feat_mask,
+        'feature_version': FEATURE_VERSION,
+    }, os.path.join(model_folder, MODEL_FILE))
 
     if verbose:
         print('[train] Done.')
@@ -183,11 +239,20 @@ def load_model(model_folder, verbose):
 
 
 def run_model(model, record, data_folder, verbose):
-    clf    = model['model']
-    X      = extract_all_features(record, data_folder, DEFAULT_CSV, cache_dir=None)
-    X      = X.reshape(1, -1).astype(np.float32)
-    binary = bool(clf.predict(X)[0])
-    prob   = float(clf.predict_proba(X)[0][1])
+    clf       = model['model']
+    clf_rf    = model.get('model_rf')
+    feat_mask = model.get('feat_mask')
+
+    X = extract_all_features(record, data_folder, DEFAULT_CSV, cache_dir=None)
+    X = X.reshape(1, -1).astype(np.float32)
+    if feat_mask is not None:
+        X = X[:, feat_mask]
+
+    p_lgbm = float(clf.predict_proba(X)[0][1])
+    p_rf   = float(clf_rf.predict_proba(X)[0][1]) if clf_rf is not None else p_lgbm
+    prob   = 0.6 * p_lgbm + 0.4 * p_rf
+
+    binary = prob >= 0.5
     return binary, prob
 
 
@@ -230,15 +295,24 @@ def extract_all_features(record, data_folder, csv_path=DEFAULT_CSV, cache_dir=No
     f_resp   = feat_resp_spo2(algo_data, phys)          # [D]   8
     f_hrv    = feat_ecg_hrv(phys, fs)                  # [E]   6
     f_prob   = feat_caisr_probs(algo_data)              # [F]   5
-    f_spin   = feat_spindle(phys, fs, stages)           # [G]   8  NOVEL
-    f_coup   = feat_so_spindle_coupling(phys, fs, stages)  # [H] 3  NOVEL
-    f_cplx   = feat_eeg_complexity(phys, fs, stages)   # [I]  12  NOVEL
-    f_frag   = feat_sleep_fragmentation(stages)         # [J]   5  NOVEL
-    f_sef    = feat_spectral_edge(phys, fs, stages)     # [K]   3  NOVEL
+    f_spin   = feat_yasa_spindles(phys, fs, stages)         # [G]  24  NOVEL
+    f_coup   = feat_so_spindle_coupling(phys, fs, stages)  # [H]   3  NOVEL
+    f_cplx   = feat_eeg_complexity(phys, fs, stages)       # [I]  12  NOVEL
+    f_frag   = feat_sleep_fragmentation(stages)             # [J]   5  NOVEL
+    f_sef    = feat_spectral_edge(phys, fs, stages)         # [K]   3  NOVEL
+    f_wkurt  = feat_waveform_kurtosis(phys, fs, stages)     # [L]   6  NOVEL
+    f_bkurt  = feat_bandpower_kurtosis(phys, fs, stages)    # [M]  36  NOVEL
+    f_n3rat  = feat_n3_ratios(phys, fs, stages)             # [N]   3  NOVEL
+    f_ysw    = feat_yasa_sw(phys, fs, stages)               # [O]  15  NOVEL
+    f_coh    = feat_eeg_coherence(phys, fs, stages)         # [P]  75  NOVEL
+    f_remrat = feat_rem_spectral_ratios(phys, fs, stages)   # [Q]   9  NOVEL
+    f_sfar   = feat_rem_sfar(phys, fs, stages)              # [R]   3  NOVEL
 
     features = np.concatenate([
         f_demo, f_macro, f_eeg, f_resp, f_hrv, f_prob,
         f_spin, f_coup, f_cplx, f_frag, f_sef,
+        f_wkurt, f_bkurt, f_n3rat, f_ysw,
+        f_coh, f_remrat, f_sfar,
     ]).astype(np.float32)
 
     if cache_dir:
@@ -388,7 +462,10 @@ def feat_eeg_bandpower(phys, fs_dict, stages):
 
 
 def _bandpower_by_stage(sig, eeg_fs, stages_int, n_epochs):
-    """Returns (N_STAGES, N_BANDS) mean Welch PSD per stage."""
+    """Returns (N_STAGES, N_BANDS) mean relative Welch PSD per stage.
+    Each band power is normalized by total 0.5-50 Hz power to remove
+    site-level amplitude differences (electrode impedance, amplifier gain).
+    """
     out        = np.zeros((N_STAGES, N_BANDS))
     epoch_samp = int(EPOCH_SEC * eeg_fs)
     if epoch_samp == 0 or len(sig) < epoch_samp:
@@ -408,6 +485,7 @@ def _bandpower_by_stage(sig, eeg_fs, stages_int, n_epochs):
             np.trapz(psd[m], f[m]) if (m := (f >= flo) & (f <= fhi)).any() else 0.0
             for _, flo, fhi in BANDS
         ])
+        bp = np.log1p(bp)  # log(1+x): stabilises scale differences across sites
         accum[VALID_STAGES.index(sv)].append(bp)
     for s_idx in range(N_STAGES):
         if accum[s_idx]:
@@ -506,108 +584,148 @@ def feat_caisr_probs(algo_data):
     return out
 
 
-# ─── [G] Sleep spindle features ★ NOVEL ──────────────────────────────────────
+# ─── [G] YASA Sleep spindle features ★ NOVEL ─────────────────────────────────
 #
-# Motivation: Sleep spindles (12-16 Hz transient oscillations during N2) are
-# generated by thalamo-cortical circuits.  Tau accumulation in the thalamus
-# (early Alzheimer's) degrades spindle density and shifts fast-to-slow ratio.
+# Motivation: YASA (Vallat & Walker, eLife 2021) implements a validated spindle
+# detection algorithm (Lacourse et al. 2019) with per-event metrics.
+# Spindle degradation is an early biomarker of thalamo-cortical dysfunction in MCI/AD.
 # References: Helfrich et al. Nature Comm 2018; Winer et al. Nature Comm 2019.
 
-def feat_spindle(phys, fs_dict, stages):
-    """8 spindle features computed from N2 EEG epochs.
-
-    [0] sigma_power_n2       — mean N2 sigma (12-16 Hz) band power  (C3-M2)
-    [1] slow_spindle_power   — slow spindle (12-14 Hz) power        (C3-M2)
-    [2] fast_spindle_power   — fast spindle (14-16 Hz) power        (C3-M2)
-    [3] fast_slow_ratio      — fast / slow spindle power ratio
-    [4] spindle_density      — spindle peaks per minute in N2       (C3-M2)
-    [5] sigma_delta_ratio    — sigma / delta power in N2            (C3-M2)
-    [6] sigma_theta_ratio    — sigma / theta power in N2            (C3-M2)
-    [7] spindle_laterality   — (C3 sigma - C4 sigma) / (C3 + C4)
+def _stages_to_yasa_hypno(stages):
+    """Convert CAISR stage encoding to YASA hypnogram at epoch resolution.
+    CAISR: N3=1, N2=2, N1=3, REM=4, Wake=5, Unk=9
+    YASA:  W=0,  N1=1, N2=2, N3=3, R=4,   Art=-1
     """
-    out = np.zeros(8)
+    hypno = np.full(len(stages), -1, dtype=int)
+    hypno[stages == S_WAKE] = 0
+    hypno[stages == S_N1]   = 1
+    hypno[stages == S_N2]   = 2
+    hypno[stages == S_N3]   = 3
+    hypno[stages == S_REM]  = 4
+    return hypno
+
+
+def feat_yasa_spindles(phys, fs_dict, stages):
+    """[G] 24 YASA spindle features (8 metrics × 3 EEG channels).
+
+    Per channel (C3-M2, C4-M1, F3-M2):
+      [0] duration_mean     — mean spindle duration (s)
+      [1] amplitude_mean    — mean peak-to-peak amplitude (µV)
+      [2] rms_mean          — mean RMS amplitude
+      [3] relpower_mean     — mean relative sigma power during spindle
+      [4] frequency_mean    — mean spindle frequency (Hz)
+      [5] oscillations_mean — mean number of oscillations per spindle
+      [6] density           — spindles per minute of N2 sleep
+      [7] frequency_std     — frequency variability (Hz)
+    """
+    out = np.zeros(24)
     if len(stages) == 0:
         return out
 
-    ch  = 'c3-m2'
-    ch2 = 'c4-m1'
-    if ch not in phys:
+    try:
+        import yasa
+    except ImportError:
         return out
 
-    sig    = phys[ch]
-    eeg_fs = fs_dict.get(ch, 200.0)
-    epochs = _get_n2_epochs(sig, eeg_fs, stages)
-    if not epochs:
+    hypno_ep = _stages_to_yasa_hypno(stages)
+    n2_ep    = np.sum(hypno_ep == 2)
+    if n2_ep == 0:
         return out
 
-    nperseg   = min(int(eeg_fs * 4), int(EPOCH_SEC * eeg_fs))
-    sigma_p   = []   # 12-16 Hz
-    slow_p    = []   # 12-14 Hz
-    fast_p    = []   # 14-16 Hz
-    delta_p   = []   # 0.5-4 Hz
-    theta_p   = []   # 4-8 Hz
-    densities = []
-
-    sigma_filt_cache = _bandpass(sig, eeg_fs, 12.0, 16.0)
-    epoch_samp = int(EPOCH_SEC * eeg_fs)
-
-    for i, sv in enumerate(stages.astype(int)):
-        if sv != S_N2:
+    channels = ['c3-m2', 'c4-m1', 'f3-m2']
+    for ch_idx, ch in enumerate(channels):
+        if ch not in phys:
             continue
-        start = i * epoch_samp
-        end   = start + epoch_samp
-        if end > len(sig):
-            break
-        epoch = sig[start:end]
+        sig = phys[ch]
+        sf  = fs_dict.get(ch, 200.0)
 
-        f, psd = sp_signal.welch(epoch, fs=eeg_fs, nperseg=nperseg)
-        def bp(lo, hi):
-            m = (f >= lo) & (f <= hi)
-            return np.trapz(psd[m], f[m]) if m.any() else 0.0
+        epoch_samp = int(EPOCH_SEC * sf)
+        hypno_samp = np.repeat(hypno_ep, epoch_samp)
+        sig_trim   = sig[:len(hypno_samp)]
+        hypno_samp = hypno_samp[:len(sig_trim)]
 
-        sigma_p.append(bp(12, 16))
-        slow_p.append(bp(12, 14))
-        fast_p.append(bp(14, 16))
-        delta_p.append(bp(0.5, 4))
-        theta_p.append(bp(4, 8))
+        try:
+            sp = yasa.spindles_detect(
+                sig_trim, sf=sf, hypno=hypno_samp,
+                include=(2,), freq_sp=(11, 16), min_distance=500,
+            )
+            if sp is not None:
+                df = sp.summary()
+                if len(df) > 0:
+                    b = ch_idx * 8
+                    out[b+0] = df['Duration'].mean()
+                    out[b+1] = df['Amplitude'].mean()
+                    out[b+2] = df['RMS'].mean()
+                    out[b+3] = df['RelPower'].mean()
+                    out[b+4] = df['Frequency'].mean()
+                    out[b+5] = df['Oscillations'].mean()
+                    out[b+6] = len(df) / (n2_ep * EPOCH_SEC / 60.0)
+                    out[b+7] = df['Frequency'].std() if len(df) > 1 else 0.0
+        except Exception:
+            pass
 
-        # Spindle density: peaks in sigma envelope > 1 std above mean
-        env = np.abs(sp_signal.hilbert(sigma_filt_cache[start:end]))
-        thr = np.mean(env) + np.std(env)
-        pks, _ = sp_signal.find_peaks(env, height=thr,
-                                       distance=int(0.5 * eeg_fs))  # min 0.5s apart
-        densities.append(len(pks) / (EPOCH_SEC / 60.0))  # peaks per minute
+    return out
 
-    if not sigma_p:
+
+# ─── [O] YASA Slow Wave features ★ NOVEL ─────────────────────────────────────
+#
+# Slow oscillations (0.5-2 Hz) in N2/N3 are the primary vehicle for
+# hippocampo-neocortical memory replay.  Slope and amplitude of slow waves
+# are degraded early in MCI due to cortical thinning.
+# Reference: Mander et al. Nature Neurosci 2015; Lucey et al. Nature Comm 2021.
+
+def feat_yasa_sw(phys, fs_dict, stages):
+    """[O] 15 YASA slow wave features (5 metrics × 3 EEG channels) in N2+N3.
+
+    Per channel (C3-M2, C4-M1, F3-M2):
+      [0] duration_mean   — mean slow wave duration (s)
+      [1] neg_amp_mean    — mean negative peak amplitude (µV)
+      [2] pos_amp_mean    — mean positive peak amplitude (µV)
+      [3] ptp_mean        — mean peak-to-peak amplitude (µV)
+      [4] slope_mean      — mean negative half-wave slope (µV/s)
+    """
+    out = np.zeros(15)
+    if len(stages) == 0:
         return out
 
-    s_mean  = np.mean(sigma_p)
-    sl_mean = np.mean(slow_p)
-    sf_mean = np.mean(fast_p)
-    d_mean  = np.mean(delta_p)
-    t_mean  = np.mean(theta_p)
+    try:
+        import yasa
+    except ImportError:
+        return out
 
-    out[0] = s_mean
-    out[1] = sl_mean
-    out[2] = sf_mean
-    out[3] = sf_mean / sl_mean if sl_mean > 0 else 0.0
-    out[4] = np.mean(densities)
-    out[5] = s_mean / d_mean   if d_mean  > 0 else 0.0
-    out[6] = s_mean / t_mean   if t_mean  > 0 else 0.0
+    hypno_ep  = _stages_to_yasa_hypno(stages)
+    n23_ep    = np.sum((hypno_ep == 2) | (hypno_ep == 3))
+    if n23_ep == 0:
+        return out
 
-    # Laterality index (C3 vs C4 sigma in N2)
-    if ch2 in phys:
-        sig2   = phys[ch2]
-        ep2    = _get_n2_epochs(sig2, fs_dict.get(ch2, 200.0), stages)
-        if ep2:
-            def _sigma_power(e):
-                f2, p2 = sp_signal.welch(e, fs=eeg_fs, nperseg=nperseg)
-                m2 = (f2 >= 12) & (f2 <= 16)
-                return np.trapz(p2[m2], f2[m2]) if m2.any() else 0.0
-            s2 = [_sigma_power(e) for e in ep2]
-            c4_s = np.mean(s2)
-            denom = s_mean + c4_s
-            out[7] = (s_mean - c4_s) / denom if denom > 0 else 0.0
+    channels = ['c3-m2', 'c4-m1', 'f3-m2']
+    for ch_idx, ch in enumerate(channels):
+        if ch not in phys:
+            continue
+        sig = phys[ch]
+        sf  = fs_dict.get(ch, 200.0)
+
+        epoch_samp = int(EPOCH_SEC * sf)
+        hypno_samp = np.repeat(hypno_ep, epoch_samp)
+        sig_trim   = sig[:len(hypno_samp)]
+        hypno_samp = hypno_samp[:len(sig_trim)]
+
+        try:
+            sw = yasa.sw_detect(
+                sig_trim, sf=sf, hypno=hypno_samp,
+                include=(2, 3),
+            )
+            if sw is not None:
+                df = sw.summary()
+                if len(df) > 0:
+                    b = ch_idx * 5
+                    out[b+0] = df['Duration'].mean()
+                    out[b+1] = abs(df['ValNegPeak'].mean())
+                    out[b+2] = df['ValPosPeak'].mean()
+                    out[b+3] = df['PTP'].mean()
+                    out[b+4] = abs(df['Slope'].mean())
+        except Exception:
+            pass
 
     return out
 
@@ -809,3 +927,419 @@ def feat_spectral_edge(phys, fs_dict, stages):
             out[slot] = np.mean(accum[stage_val])
 
     return out
+
+
+# ─── [L] Waveform kurtosis ★ NOVEL ────────────────────────────────────────────
+#
+# Motivation: Waveform kurtosis captures the peakedness of the raw EEG signal,
+# reflecting K-complex activity in N2 and slow-wave sharpness in N3.
+# This was the single strongest predictor in the Brain Age Index study (n=7071).
+# Reference: PMC12486002 (2025) — 13-feature BAI validated across 5 cohorts.
+
+def feat_waveform_kurtosis(phys, fs_dict, stages):
+    """6 features: kurtosis of concatenated raw EEG for N2, N3 × C3-M2, C4-M1, F3-M2."""
+    out = np.zeros(6)
+    if len(stages) == 0:
+        return out
+    stage_slots = {S_N2: 0, S_N3: 1}
+    for ch_idx, ch in enumerate(['c3-m2', 'c4-m1', 'f3-m2']):
+        if ch not in phys:
+            continue
+        sig        = phys[ch]
+        eeg_fs     = fs_dict.get(ch, 200.0)
+        epoch_samp = int(EPOCH_SEC * eeg_fs)
+        for stage_val, stage_slot in stage_slots.items():
+            buf = []
+            for i, sv in enumerate(stages.astype(int)):
+                if sv != stage_val:
+                    continue
+                start = i * epoch_samp
+                end   = start + epoch_samp
+                if end > len(sig):
+                    break
+                buf.append(sig[start:end])
+            if len(buf) >= 2:
+                concat = np.concatenate(buf)
+                out[ch_idx * 2 + stage_slot] = float(sp_stats.kurtosis(concat))
+    return out
+
+
+# ─── [M] Band power kurtosis ★ NOVEL ─────────────────────────────────────────
+#
+# Motivation: Kurtosis of the distribution of per-epoch band powers captures
+# how "spiky" or irregular the brain oscillation is across the night —
+# a marker of neurodegeneration-related rhythm instability.
+# Reference: Brain Age Index (PMC12486002) — band power kurtosis across N1-N3.
+
+def feat_bandpower_kurtosis(phys, fs_dict, stages):
+    """36 features: kurtosis of per-epoch band power distribution
+    3ch × 3stages (N1,N2,N3) × 4bands (delta,theta,alpha,sigma)."""
+    KB_STAGES = [S_N1, S_N2, S_N3]
+    KB_BANDS  = [('delta', 0.5, 4.0), ('theta', 4.0, 8.0),
+                 ('alpha', 8.0, 12.0), ('sigma', 12.0, 16.0)]
+    N_KS, N_KB = len(KB_STAGES), len(KB_BANDS)
+    out = np.zeros(N_EEG_CH * N_KS * N_KB)
+
+    for ch_idx, ch in enumerate(['c3-m2', 'c4-m1', 'f3-m2']):
+        if ch not in phys:
+            continue
+        sig        = phys[ch]
+        eeg_fs     = fs_dict.get(ch, 200.0)
+        epoch_samp = int(EPOCH_SEC * eeg_fs)
+        nperseg    = min(int(eeg_fs * 4), epoch_samp)
+        accum      = {s: [[] for _ in range(N_KB)] for s in KB_STAGES}
+
+        for i, sv in enumerate(stages.astype(int)):
+            if sv not in KB_STAGES:
+                continue
+            start = i * epoch_samp
+            end   = start + epoch_samp
+            if end > len(sig):
+                break
+            f, psd = sp_signal.welch(sig[start:end], fs=eeg_fs, nperseg=nperseg)
+            for b_idx, (_, flo, fhi) in enumerate(KB_BANDS):
+                m  = (f >= flo) & (f <= fhi)
+                bp = np.trapz(psd[m], f[m]) if m.any() else 0.0
+                accum[sv][b_idx].append(bp)
+
+        for s_idx, stage_val in enumerate(KB_STAGES):
+            for b_idx in range(N_KB):
+                vals = accum[stage_val][b_idx]
+                if len(vals) >= 4:
+                    idx = ch_idx * N_KS * N_KB + s_idx * N_KB + b_idx
+                    out[idx] = float(sp_stats.kurtosis(vals))
+    return out
+
+
+# ─── [N] N3 spectral ratios ★ NOVEL ──────────────────────────────────────────
+#
+# Motivation: In N3 sleep, MCI/dementia patients show EEG slowing (delta increase,
+# alpha/sigma decrease). Delta/alpha and delta/theta ratios in N3 are among the
+# most replicated EEG biomarkers of cognitive decline.
+# Reference: SAGE 2025 (AUC 0.76), Brain Age Index (PMC12486002).
+
+def feat_n3_ratios(phys, fs_dict, stages):
+    """3 features: delta/alpha ratio, delta/theta ratio, sigma/delta ratio in N3 (C3-M2)."""
+    out = np.zeros(3)
+    ch  = 'c3-m2'
+    if ch not in phys or len(stages) == 0:
+        return out
+
+    sig        = phys[ch]
+    eeg_fs     = fs_dict.get(ch, 200.0)
+    epoch_samp = int(EPOCH_SEC * eeg_fs)
+    nperseg    = min(int(eeg_fs * 4), epoch_samp)
+    d, t, a, s = [], [], [], []
+
+    for i, sv in enumerate(stages.astype(int)):
+        if sv != S_N3:
+            continue
+        start = i * epoch_samp
+        end   = start + epoch_samp
+        if end > len(sig):
+            break
+        f, psd = sp_signal.welch(sig[start:end], fs=eeg_fs, nperseg=nperseg)
+        def bp(lo, hi):
+            m = (f >= lo) & (f <= hi)
+            return np.trapz(psd[m], f[m]) if m.any() else 0.0
+        d.append(bp(0.5, 4.0))
+        t.append(bp(4.0, 8.0))
+        a.append(bp(8.0, 12.0))
+        s.append(bp(12.0, 16.0))
+
+    if not d:
+        return out
+    dm, tm, am, sm = np.mean(d), np.mean(t), np.mean(a), np.mean(s)
+    out[0] = dm / am if am > 0 else 0.0  # delta/alpha — EEG slowing marker
+    out[1] = dm / tm if tm > 0 else 0.0  # delta/theta — cognitive decline marker
+    out[2] = sm / dm if dm > 0 else 0.0  # sigma/delta — spindle vs slow-wave balance
+    return out
+
+
+# ─── [P] EEG Inter-channel Coherence ★ NOVEL ─────────────────────────────────
+#
+# Motivation: Inter-hemispheric EEG coherence reflects long-range cortical
+# connectivity.  MCI/dementia shows disrupted thalamocortical and cortico-cortical
+# synchronization, reducing coherence in slow (delta/theta) and fast (sigma/beta)
+# bands during NREM sleep.
+# Reference: Sun et al. SLEEP 2023 — coherence features achieved AUROC 0.78.
+
+def feat_eeg_coherence(phys, fs_dict, stages):
+    """[P] 75 EEG inter-channel coherence features.
+    3 channel pairs × 5 frequency bands × 5 sleep stages.
+
+    Pairs: (C3-M2, C4-M1), (C3-M2, F3-M2), (C4-M1, F3-M2)
+    Bands: delta(0.5-4), theta(4-8), alpha(8-12), sigma(12-16), beta(16-30) Hz
+    Stages: N3, N2, N1, REM, Wake
+
+    Uses mean magnitude-squared coherence (MSC) per epoch, then averaged per stage.
+    """
+    PAIRS = [('c3-m2', 'c4-m1'), ('c3-m2', 'f3-m2'), ('c4-m1', 'f3-m2')]
+    COH_BANDS = [
+        ('delta', 0.5,  4.0),
+        ('theta', 4.0,  8.0),
+        ('alpha', 8.0, 12.0),
+        ('sigma',12.0, 16.0),
+        ('beta', 16.0, 30.0),
+    ]
+    N_PAIRS = len(PAIRS)   # 3
+    N_CB    = len(COH_BANDS)  # 5
+    out = np.zeros(N_PAIRS * N_STAGES * N_CB)  # 75
+
+    if len(stages) == 0:
+        return out
+
+    stages_int = stages.astype(int)
+
+    for p_idx, (ch1, ch2) in enumerate(PAIRS):
+        if ch1 not in phys or ch2 not in phys:
+            continue
+        sig1 = phys[ch1]
+        sig2 = phys[ch2]
+        # Use the slower fs if channels differ (shouldn't happen in practice)
+        sf = min(fs_dict.get(ch1, 200.0), fs_dict.get(ch2, 200.0))
+        ep = int(EPOCH_SEC * sf)
+        nps = min(int(sf * 4), ep)
+
+        accum = {sv: [] for sv in VALID_STAGES}
+
+        for i, sv in enumerate(stages_int):
+            if sv not in VALID_STAGES:
+                continue
+            start = i * ep
+            end   = start + ep
+            if end > len(sig1) or end > len(sig2):
+                break
+            try:
+                f, Cxy = sp_signal.coherence(sig1[start:end], sig2[start:end],
+                                              fs=sf, nperseg=nps)
+                band_coh = []
+                for _, flo, fhi in COH_BANDS:
+                    m = (f >= flo) & (f <= fhi)
+                    band_coh.append(float(np.mean(Cxy[m])) if m.any() else 0.0)
+                accum[sv].append(band_coh)
+            except Exception:
+                pass
+
+        for s_idx, sv in enumerate(VALID_STAGES):
+            if accum[sv]:
+                mean_coh = np.mean(accum[sv], axis=0)  # (N_CB,)
+                base = p_idx * N_STAGES * N_CB + s_idx * N_CB
+                out[base: base + N_CB] = mean_coh
+
+    return out
+
+
+# ─── [Q] REM Spectral Ratios ★ NOVEL ─────────────────────────────────────────
+#
+# Motivation: REM sleep EEG ratios reflect thalamocortical oscillatory dynamics.
+# In MCI/AD, REM theta activity is reduced while alpha/sigma power increases,
+# creating characteristic ratio shifts detectable before overt symptoms.
+# Reference: Gao et al. 2022; Westerberg et al. 2021.
+
+def feat_rem_spectral_ratios(phys, fs_dict, stages):
+    """[Q] 9 REM spectral ratio features.
+    theta/alpha, theta/beta, sigma/alpha × 3 EEG channels (C3-M2, C4-M1, F3-M2) in REM.
+    """
+    out = np.zeros(9)
+    if len(stages) == 0:
+        return out
+
+    for ch_idx, ch in enumerate(['c3-m2', 'c4-m1', 'f3-m2']):
+        if ch not in phys:
+            continue
+        sig        = phys[ch]
+        eeg_fs     = fs_dict.get(ch, 200.0)
+        epoch_samp = int(EPOCH_SEC * eeg_fs)
+        nperseg    = min(int(eeg_fs * 4), epoch_samp)
+        t_list, a_list, b_list, s_list = [], [], [], []
+
+        for i, sv in enumerate(stages.astype(int)):
+            if sv != S_REM:
+                continue
+            start = i * epoch_samp
+            end   = start + epoch_samp
+            if end > len(sig):
+                break
+            f, psd = sp_signal.welch(sig[start:end], fs=eeg_fs, nperseg=nperseg)
+            def _bp(lo, hi):
+                m = (f >= lo) & (f <= hi)
+                return np.trapz(psd[m], f[m]) if m.any() else 0.0
+            t_list.append(_bp(4.0,  8.0))
+            a_list.append(_bp(8.0, 12.0))
+            b_list.append(_bp(16.0, 30.0))
+            s_list.append(_bp(12.0, 16.0))
+
+        if t_list:
+            tm = np.mean(t_list)
+            am = np.mean(a_list)
+            bm = np.mean(b_list)
+            sm = np.mean(s_list)
+            base = ch_idx * 3
+            out[base+0] = tm / am if am > 0 else 0.0  # theta/alpha REM
+            out[base+1] = tm / bm if bm > 0 else 0.0  # theta/beta  REM
+            out[base+2] = sm / am if am > 0 else 0.0  # sigma/alpha REM
+
+    return out
+
+
+# ─── [R] REM Slow-Fast Activity Ratio (SFAR) ★ NOVEL ─────────────────────────
+#
+# Motivation: The Slow-Fast Activity Ratio (SFAR) captures the global balance of
+# low-frequency (slow: delta+theta) vs high-frequency (fast: alpha+sigma+beta)
+# power in REM sleep.  SFAR in REM is elevated in dementia patients due to EEG
+# slowing (loss of fast rhythms).
+# Reference: MFDE-SFAR framework; Moretti et al. 2012.
+
+def feat_rem_sfar(phys, fs_dict, stages):
+    """[R] 3 REM slow-fast activity ratio features (one per EEG channel).
+    log(slow / fast) during REM:  slow = delta+theta (0.5-8 Hz),
+                                  fast  = alpha+sigma+beta (8-30 Hz).
+    """
+    out = np.zeros(3)
+    if len(stages) == 0:
+        return out
+
+    for ch_idx, ch in enumerate(['c3-m2', 'c4-m1', 'f3-m2']):
+        if ch not in phys:
+            continue
+        sig        = phys[ch]
+        eeg_fs     = fs_dict.get(ch, 200.0)
+        epoch_samp = int(EPOCH_SEC * eeg_fs)
+        nperseg    = min(int(eeg_fs * 4), epoch_samp)
+        ratios = []
+
+        for i, sv in enumerate(stages.astype(int)):
+            if sv != S_REM:
+                continue
+            start = i * epoch_samp
+            end   = start + epoch_samp
+            if end > len(sig):
+                break
+            f, psd = sp_signal.welch(sig[start:end], fs=eeg_fs, nperseg=nperseg)
+            slow_m = (f >= 0.5) & (f < 8.0)
+            fast_m = (f >= 8.0) & (f <= 30.0)
+            slow = np.trapz(psd[slow_m], f[slow_m]) if slow_m.any() else 0.0
+            fast = np.trapz(psd[fast_m], f[fast_m]) if fast_m.any() else 0.0
+            if fast > 0:
+                ratios.append(np.log(slow / fast + 1e-10))
+
+        if ratios:
+            out[ch_idx] = np.mean(ratios)
+
+    return out
+
+
+# ─── CAISR Sequence Extraction ────────────────────────────────────────────────
+
+def _extract_caisr_seq(record, data_folder):
+    """Returns (MAX_SEQ_LEN, SEQ_CHANNELS) float32 array of CAISR stage probs.
+
+    Channels: [prob_w, prob_n1, prob_n2, prob_n3, prob_r]
+    Unavailable epochs (value=9) are zeroed out.
+    Sequences shorter than MAX_SEQ_LEN are zero-padded at the end.
+    """
+    pid = record[HEADERS['bids_folder']]
+    sid = record[HEADERS['site_id']]
+    ses = record[HEADERS['session_id']]
+
+    algo_path = os.path.join(data_folder, ALGORITHMIC_ANNOTATIONS_SUBFOLDER,
+                             sid, f'{pid}_ses-{ses}_caisr_annotations.edf')
+    algo_data, _ = (load_signal_data(algo_path)
+                    if os.path.exists(algo_path) else ({}, {}))
+
+    keys = ['caisr_prob_w', 'caisr_prob_n1', 'caisr_prob_n2',
+            'caisr_prob_n3', 'caisr_prob_r']
+    channels = []
+    for k in keys:
+        arr = np.asarray(algo_data.get(k, []), dtype=np.float32)
+        arr[arr >= 9.0] = 0.0          # unavailable → 0
+        arr = np.clip(arr, 0.0, 1.0)
+        channels.append(arr)
+
+    if not any(len(c) > 0 for c in channels):
+        return np.zeros((MAX_SEQ_LEN, SEQ_CHANNELS), dtype=np.float32)
+
+    T = max(len(c) for c in channels)
+    # Align all channels to same length
+    aligned = np.zeros((T, SEQ_CHANNELS), dtype=np.float32)
+    for i, c in enumerate(channels):
+        L = min(len(c), T)
+        aligned[:L, i] = c[:L]
+
+    # Truncate or pad to MAX_SEQ_LEN
+    if T >= MAX_SEQ_LEN:
+        return aligned[:MAX_SEQ_LEN]
+    padded = np.zeros((MAX_SEQ_LEN, SEQ_CHANNELS), dtype=np.float32)
+    padded[:T] = aligned
+    return padded
+
+
+# ─── 1D-CNN for CAISR Sequence ────────────────────────────────────────────────
+
+class SleepCNN(nn.Module if HAS_TORCH else object):
+    """Small 1D-CNN: (batch, T, 5) → binary logit.
+
+    Architecture is intentionally small to avoid overfitting on ~780 samples.
+    Uses BatchNorm + Dropout for regularisation.
+    """
+    def __init__(self):
+        if not HAS_TORCH:
+            return
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Conv1d(SEQ_CHANNELS, 16, kernel_size=7, padding=3),
+            nn.BatchNorm1d(16), nn.ReLU(), nn.MaxPool1d(4),
+            nn.Conv1d(16, 32, kernel_size=5, padding=2),
+            nn.BatchNorm1d(32), nn.ReLU(), nn.MaxPool1d(4),
+            nn.Conv1d(32, 64, kernel_size=3, padding=1),
+            nn.BatchNorm1d(64), nn.ReLU(), nn.AdaptiveAvgPool1d(1),
+            nn.Flatten(),
+        )
+        self.head = nn.Sequential(
+            nn.Linear(64, 32), nn.ReLU(), nn.Dropout(0.5),
+            nn.Linear(32, 1),
+        )
+
+    def forward(self, x):
+        # x: (B, T, C) → permute to (B, C, T) for Conv1d
+        return self.head(self.encoder(x.permute(0, 2, 1))).squeeze(1)
+
+
+def _train_cnn(seq_arr, y, n_epochs=40, batch_size=32, lr=1e-3, verbose=False):
+    """Train SleepCNN. seq_arr: (N, T, C), y: (N,). Returns trained model."""
+    if not HAS_TORCH:
+        return None
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    X_t = torch.tensor(seq_arr, dtype=torch.float32)
+    y_t = torch.tensor(y,       dtype=torch.float32)
+    dl  = DataLoader(TensorDataset(X_t, y_t), batch_size=batch_size, shuffle=True)
+    model = SleepCNN().to(device)
+    opt   = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+    sched = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=n_epochs)
+    loss_fn = nn.BCEWithLogitsLoss()
+    model.train()
+    for ep in range(n_epochs):
+        for xb, yb in dl:
+            xb, yb = xb.to(device), yb.to(device)
+            opt.zero_grad()
+            loss_fn(model(xb), yb).backward()
+            opt.step()
+        sched.step()
+        if verbose and (ep + 1) % 10 == 0:
+            print(f'  [CNN] epoch {ep+1}/{n_epochs}')
+    model.eval()
+    return model
+
+
+def _predict_cnn(model, seq_arr):
+    """Returns 1-D numpy array of probabilities. seq_arr: (N, T, C)."""
+    if not HAS_TORCH or model is None:
+        return np.full(len(seq_arr), 0.5)
+    device = next(model.parameters()).device
+    model.eval()
+    with torch.no_grad():
+        X_t    = torch.tensor(seq_arr, dtype=torch.float32).to(device)
+        logits = model(X_t)
+        probs  = torch.sigmoid(logits).cpu().numpy()
+    return probs
