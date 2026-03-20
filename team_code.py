@@ -161,6 +161,8 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
     from sklearn.metrics import roc_auc_score
     from sklearn.ensemble import RandomForestClassifier, ExtraTreesClassifier, StackingClassifier
     from sklearn.linear_model import LogisticRegression
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.pipeline import Pipeline
     from sklearn.base import clone
 
     # ── Base model factories ──────────────────────────────────────────────────
@@ -224,11 +226,12 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
         )
 
     def _make_lr():
-        # Linear model adds diversity to tree-based ensemble
-        return LogisticRegression(
-            C=0.05, max_iter=2000, solver='lbfgs',
-            random_state=42,
-        )
+        # Linear model with scaling — adds diversity to tree-based ensemble
+        return Pipeline([
+            ('scaler', StandardScaler()),
+            ('lr', LogisticRegression(C=0.05, max_iter=3000, solver='saga',
+                                      random_state=42)),
+        ])
 
     # ── Feature selection: drop bottom 40% by LGBM importance ────────────────
     if verbose:
@@ -263,12 +266,12 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
         cv=5,
         stack_method='predict_proba',
         n_jobs=-1,
-        passthrough=True,   # meta-learner also gets original features
+        passthrough=False,
     )
 
     # ── 5-fold stratified CV to report honest AUROC ───────────────────────────
     if verbose:
-        print(f'[CV] 5-fold CV | {len(estimators)} base models + passthrough meta ...')
+        print(f'[CV] 5-fold CV | {len(estimators)} base models ...')
     skf  = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
     aucs = []
     for fold, (tr_idx, val_idx) in enumerate(skf.split(X_sel, y_arr), 1):
@@ -276,7 +279,7 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
             estimators=[(n, clone(m)) for n, m in estimators],
             final_estimator=clone(final_estimator),
             cv=5, stack_method='predict_proba',
-            passthrough=True, n_jobs=-1,
+            passthrough=False, n_jobs=-1,
         )
         fold_stack.fit(X_sel[tr_idx], y_arr[tr_idx])
         prob = fold_stack.predict_proba(X_sel[val_idx])[:, 1]
