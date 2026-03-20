@@ -161,20 +161,21 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
     from sklearn.metrics import roc_auc_score
     from sklearn.ensemble import RandomForestClassifier, ExtraTreesClassifier, StackingClassifier
     from sklearn.linear_model import LogisticRegression
+    from sklearn.base import clone
 
     # ── Base model factories ──────────────────────────────────────────────────
     def _make_lgbm():
         if HAS_LGBM:
             return lgb.LGBMClassifier(
-                n_estimators=600,
+                n_estimators=800,
                 num_leaves=31,
                 learning_rate=0.02,
-                min_child_samples=20,
+                min_child_samples=30,
                 subsample=0.8,
                 subsample_freq=1,
                 colsample_bytree=0.7,
-                reg_alpha=0.1,
-                reg_lambda=2.0,
+                reg_alpha=0.2,
+                reg_lambda=3.0,
                 random_state=42,
                 n_jobs=-1,
                 verbose=-1,
@@ -182,20 +183,20 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
         else:
             from sklearn.ensemble import GradientBoostingClassifier
             return GradientBoostingClassifier(
-                n_estimators=400, max_depth=4,
+                n_estimators=500, max_depth=4,
                 learning_rate=0.02, subsample=0.8, random_state=42,
             )
 
     def _make_xgb():
         if HAS_XGB:
             return xgb.XGBClassifier(
-                n_estimators=600,
+                n_estimators=800,
                 max_depth=4,
                 learning_rate=0.02,
                 subsample=0.8,
                 colsample_bytree=0.7,
-                reg_alpha=0.1,
-                reg_lambda=2.0,
+                reg_alpha=0.2,
+                reg_lambda=3.0,
                 use_label_encoder=False,
                 eval_metric='logloss',
                 random_state=42,
@@ -206,20 +207,27 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
 
     def _make_rf():
         return RandomForestClassifier(
-            n_estimators=400,
+            n_estimators=500,
             max_features='sqrt',
-            min_samples_leaf=4,
+            min_samples_leaf=5,
             random_state=42,
             n_jobs=-1,
         )
 
     def _make_et():
         return ExtraTreesClassifier(
-            n_estimators=400,
+            n_estimators=500,
             max_features='sqrt',
-            min_samples_leaf=4,
+            min_samples_leaf=5,
             random_state=42,
             n_jobs=-1,
+        )
+
+    def _make_lr():
+        # Linear model adds diversity to tree-based ensemble
+        return LogisticRegression(
+            C=0.05, max_iter=2000, solver='lbfgs',
+            random_state=42,
         )
 
     # ── Feature selection: drop bottom 40% by LGBM importance ────────────────
@@ -234,35 +242,41 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
     if verbose:
         print(f'[FS] Selected {feat_mask.sum()}/{len(feat_mask)} features (threshold={threshold:.4f})')
 
-    # ── Build stacking ensemble ───────────────────────────────────────────────
+    # ── Build stacking ensemble (passthrough=True) ────────────────────────────
+    # passthrough=True: meta-learner sees base OOF predictions + original features
+    # This lets LogReg directly use strong single features as well as ensemble output
     estimators = [
         ('lgbm', _make_lgbm()),
         ('rf',   _make_rf()),
         ('et',   _make_et()),
+        ('lr',   _make_lr()),
     ]
     xgb_clf = _make_xgb()
     if xgb_clf is not None:
         estimators.append(('xgb', xgb_clf))
 
+    final_estimator = LogisticRegression(C=0.1, max_iter=2000, random_state=42)
+
     stack = StackingClassifier(
         estimators=estimators,
-        final_estimator=LogisticRegression(C=0.5, max_iter=1000, random_state=42),
+        final_estimator=final_estimator,
         cv=5,
         stack_method='predict_proba',
         n_jobs=-1,
-        passthrough=False,
+        passthrough=True,   # meta-learner also gets original features
     )
 
     # ── 5-fold stratified CV to report honest AUROC ───────────────────────────
     if verbose:
-        print(f'[CV] Running 5-fold CV on stacking ensemble ({len(estimators)} base models) ...')
+        print(f'[CV] 5-fold CV | {len(estimators)} base models + passthrough meta ...')
     skf  = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
     aucs = []
     for fold, (tr_idx, val_idx) in enumerate(skf.split(X_sel, y_arr), 1):
         fold_stack = StackingClassifier(
-            estimators=[(n, type(m)(**m.get_params())) for n, m in estimators],
-            final_estimator=LogisticRegression(C=0.5, max_iter=1000, random_state=42),
-            cv=5, stack_method='predict_proba', n_jobs=-1,
+            estimators=[(n, clone(m)) for n, m in estimators],
+            final_estimator=clone(final_estimator),
+            cv=5, stack_method='predict_proba',
+            passthrough=True, n_jobs=-1,
         )
         fold_stack.fit(X_sel[tr_idx], y_arr[tr_idx])
         prob = fold_stack.predict_proba(X_sel[val_idx])[:, 1]
