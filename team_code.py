@@ -1,16 +1,16 @@
 #!/usr/bin/env python
 # team_code.py — PhysioNet Challenge 2026
 #
-# Feature groups (total = 325):
+# Feature groups (total = 302):
 #   [A]  demographics          10   age, sex×3, race×5, BMI
 #   [B]  sleep macrostructure  12   SL, TST, SE, WASO, stage%, REMlat, trans, TIB
 #   [C]  EEG bandpower         90   3ch × 5stages × 6bands (delta–gamma) — log1p
 #   [D]  resp / SpO2            8   AHI, arousal_idx, PLMI, SpO2 stats, ODI
 #   [E]  ECG HRV                6   mean_RR, SDNN, RMSSD, HR, pNN50, NN_range
 #   [F]  CAISR probabilities    5   prob_w/n3/n2/n1/r
-#   [G]  YASA spindles         24   8 feats × 3ch (YASA validated algorithm)     *** NOVEL ***
-#                                   duration, amplitude, RMS, relpower, freq,
-#                                   oscillations, density, freq_std
+#   [G]  Custom spindles        18  6 feats × 3ch — sigma-band envelope det.    *** NOVEL ***
+#                                   sigma_power, density, amplitude, duration,
+#                                   sigma/alpha, sigma/delta (N2 sleep)
 #   [H]  SO-spindle coupling    3   delta-sigma PAC (MVL) per EEG channel        *** NOVEL ***
 #   [I]  EEG complexity        12   Hjorth (act/mob/cmp) + spectral entropy      *** NOVEL ***
 #                                   for N2, N3, REM (C3-M2)
@@ -21,8 +21,6 @@
 #   [M]  band power kurtosis   36   kurt(band power across epochs)               *** NOVEL ***
 #                                   3ch × 3stages(N1,N2,N3) × 4bands
 #   [N]  N3 spectral ratios     3   delta/alpha, delta/theta, sigma/delta (N3)   *** NOVEL ***
-#   [O]  YASA slow waves       15   5 feats × 3ch (duration, neg/pos amp,        *** NOVEL ***
-#                                   ptp, slope) in N2+N3
 #   [P]  EEG coherence         75   3pairs × 5bands × 5stages (MSC)             *** NOVEL ***
 #                                   pairs: C3-C4, C3-F3, C4-F3
 #                                   bands: delta,theta,alpha,sigma,beta
@@ -32,11 +30,14 @@
 #   [R]  REM slow-fast ratio    3   log(slow/fast) in REM per EEG channel        *** NOVEL ***
 #                                   SFAR: slow=(delta+theta), fast=(alpha+sigma+beta)
 #
-# Data distribution insight: age/sex/BMI/race are nearly identical between classes.
-# The strongest predictors are EEG microstructure (kurtosis, ratios) — Brain Age Index.
-# EEG coherence between hemispheres is disrupted early in MCI (Sun et al. 2023).
+# Note: [G] YASA spindles (24) and [O] YASA slow waves (15) removed in v9.
+#       YASA added noise via CHAN000 bug (all-zero features). Replaced with
+#       fast scipy-based custom spindle detection.
 #
-# Model: LightGBM + Random Forest ensemble with feature selection
+# Model: 4-model Stacking Ensemble (v9)
+#   Level-0: LightGBM, XGBoost, ExtraTrees, RandomForest
+#   Level-1: LogisticRegression (learns optimal combination via 5-fold OOF)
+#   Feature selection: drop bottom 40% by LightGBM importance before stacking
 
 import joblib
 import numpy as np
@@ -50,6 +51,12 @@ try:
     HAS_LGBM = True
 except ImportError:
     HAS_LGBM = False
+
+try:
+    import xgboost as xgb
+    HAS_XGB = True
+except ImportError:
+    HAS_XGB = False
 
 try:
     import torch
@@ -75,7 +82,7 @@ SCRIPT_DIR      = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CSV     = os.path.join(SCRIPT_DIR, 'channel_table.csv')
 CACHE_SUBDIR    = 'feature_cache'
 MODEL_FILE      = 'model.sav'
-FEATURE_VERSION = 'v8'   # bump when feature layout changes to invalidate old cache
+FEATURE_VERSION = 'v9'   # bump when feature layout changes to invalidate old cache
 
 # stage_caisr: fs=1/30 Hz → one sample per 30-second PSG epoch
 # Encoding: 1=N3, 2=N2, 3=N1, 4=REM, 5=Wake, 9=Unavailable
@@ -152,20 +159,22 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
 
     from sklearn.model_selection import StratifiedKFold
     from sklearn.metrics import roc_auc_score
-    from sklearn.ensemble import RandomForestClassifier
+    from sklearn.ensemble import RandomForestClassifier, ExtraTreesClassifier, StackingClassifier
+    from sklearn.linear_model import LogisticRegression
 
+    # ── Base model factories ──────────────────────────────────────────────────
     def _make_lgbm():
         if HAS_LGBM:
             return lgb.LGBMClassifier(
-                n_estimators=500,
+                n_estimators=600,
                 num_leaves=31,
-                learning_rate=0.03,
-                min_child_samples=30,
+                learning_rate=0.02,
+                min_child_samples=20,
                 subsample=0.8,
                 subsample_freq=1,
                 colsample_bytree=0.7,
                 reg_alpha=0.1,
-                reg_lambda=1.5,
+                reg_lambda=2.0,
                 random_state=42,
                 n_jobs=-1,
                 verbose=-1,
@@ -173,60 +182,105 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
         else:
             from sklearn.ensemble import GradientBoostingClassifier
             return GradientBoostingClassifier(
-                n_estimators=300, max_depth=4,
-                learning_rate=0.03, subsample=0.8, random_state=42,
+                n_estimators=400, max_depth=4,
+                learning_rate=0.02, subsample=0.8, random_state=42,
             )
+
+    def _make_xgb():
+        if HAS_XGB:
+            return xgb.XGBClassifier(
+                n_estimators=600,
+                max_depth=4,
+                learning_rate=0.02,
+                subsample=0.8,
+                colsample_bytree=0.7,
+                reg_alpha=0.1,
+                reg_lambda=2.0,
+                use_label_encoder=False,
+                eval_metric='logloss',
+                random_state=42,
+                n_jobs=-1,
+                verbosity=0,
+            )
+        return None
 
     def _make_rf():
         return RandomForestClassifier(
-            n_estimators=300,
+            n_estimators=400,
             max_features='sqrt',
-            min_samples_leaf=5,
+            min_samples_leaf=4,
             random_state=42,
             n_jobs=-1,
         )
 
-    # ── Feature selection: drop bottom 20% by LGBM importance ────────────────
+    def _make_et():
+        return ExtraTreesClassifier(
+            n_estimators=400,
+            max_features='sqrt',
+            min_samples_leaf=4,
+            random_state=42,
+            n_jobs=-1,
+        )
+
+    # ── Feature selection: drop bottom 40% by LGBM importance ────────────────
     if verbose:
         print('[FS] Fitting LGBM for feature importance ...')
     clf_fs = _make_lgbm()
     clf_fs.fit(X_arr, y_arr)
     importances = clf_fs.feature_importances_
-    threshold   = np.percentile(importances, 20)
+    threshold   = np.percentile(importances, 40)
     feat_mask   = importances >= threshold
     X_sel       = X_arr[:, feat_mask]
     if verbose:
         print(f'[FS] Selected {feat_mask.sum()}/{len(feat_mask)} features (threshold={threshold:.4f})')
 
-    # ── 5-fold stratified cross-validation (LGBM + RF ensemble) ─────────────
+    # ── Build stacking ensemble ───────────────────────────────────────────────
+    estimators = [
+        ('lgbm', _make_lgbm()),
+        ('rf',   _make_rf()),
+        ('et',   _make_et()),
+    ]
+    xgb_clf = _make_xgb()
+    if xgb_clf is not None:
+        estimators.append(('xgb', xgb_clf))
+
+    stack = StackingClassifier(
+        estimators=estimators,
+        final_estimator=LogisticRegression(C=0.5, max_iter=1000, random_state=42),
+        cv=5,
+        stack_method='predict_proba',
+        n_jobs=-1,
+        passthrough=False,
+    )
+
+    # ── 5-fold stratified CV to report honest AUROC ───────────────────────────
     if verbose:
-        print('[CV] Running 5-fold stratified CV (LGBM + RF) ...')
+        print(f'[CV] Running 5-fold CV on stacking ensemble ({len(estimators)} base models) ...')
     skf  = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
     aucs = []
     for fold, (tr_idx, val_idx) in enumerate(skf.split(X_sel, y_arr), 1):
-        cv_lgbm = _make_lgbm()
-        cv_rf   = _make_rf()
-        cv_lgbm.fit(X_sel[tr_idx], y_arr[tr_idx])
-        cv_rf.fit(X_sel[tr_idx], y_arr[tr_idx])
-        p_lgbm = cv_lgbm.predict_proba(X_sel[val_idx])[:, 1]
-        p_rf   = cv_rf.predict_proba(X_sel[val_idx])[:, 1]
-        prob   = 0.6 * p_lgbm + 0.4 * p_rf
-        auc = roc_auc_score(y_arr[val_idx], prob)
+        fold_stack = StackingClassifier(
+            estimators=[(n, type(m)(**m.get_params())) for n, m in estimators],
+            final_estimator=LogisticRegression(C=0.5, max_iter=1000, random_state=42),
+            cv=5, stack_method='predict_proba', n_jobs=-1,
+        )
+        fold_stack.fit(X_sel[tr_idx], y_arr[tr_idx])
+        prob = fold_stack.predict_proba(X_sel[val_idx])[:, 1]
+        auc  = roc_auc_score(y_arr[val_idx], prob)
         aucs.append(auc)
         if verbose:
             print(f'  Fold {fold}: AUROC={auc:.4f}')
     if verbose:
         print(f'[CV] Mean AUROC = {np.mean(aucs):.4f}  std = {np.std(aucs):.4f}')
-    # ─────────────────────────────────────────────────────────────────────────
 
-    clf    = _make_lgbm()
-    clf_rf = _make_rf()
-    clf.fit(X_sel, y_arr)
-    clf_rf.fit(X_sel, y_arr)
+    # ── Train final stacking model on full data ───────────────────────────────
+    if verbose:
+        print('[train] Fitting final stacking model on full data ...')
+    stack.fit(X_sel, y_arr)
 
     joblib.dump({
-        'model': clf, 'model_rf': clf_rf,
-        'feat_mask': feat_mask,
+        'stack':           stack,
+        'feat_mask':       feat_mask,
         'feature_version': FEATURE_VERSION,
     }, os.path.join(model_folder, MODEL_FILE))
 
@@ -239,8 +293,7 @@ def load_model(model_folder, verbose):
 
 
 def run_model(model, record, data_folder, verbose):
-    clf       = model['model']
-    clf_rf    = model.get('model_rf')
+    stack     = model['stack']
     feat_mask = model.get('feat_mask')
 
     X = extract_all_features(record, data_folder, DEFAULT_CSV, cache_dir=None)
@@ -248,10 +301,7 @@ def run_model(model, record, data_folder, verbose):
     if feat_mask is not None:
         X = X[:, feat_mask]
 
-    p_lgbm = float(clf.predict_proba(X)[0][1])
-    p_rf   = float(clf_rf.predict_proba(X)[0][1]) if clf_rf is not None else p_lgbm
-    prob   = 0.6 * p_lgbm + 0.4 * p_rf
-
+    prob   = float(stack.predict_proba(X)[0][1])
     binary = prob >= 0.5
     return binary, prob
 
@@ -295,23 +345,22 @@ def extract_all_features(record, data_folder, csv_path=DEFAULT_CSV, cache_dir=No
     f_resp   = feat_resp_spo2(algo_data, phys)          # [D]   8
     f_hrv    = feat_ecg_hrv(phys, fs)                  # [E]   6
     f_prob   = feat_caisr_probs(algo_data)              # [F]   5
-    f_spin   = feat_yasa_spindles(phys, fs, stages)         # [G]  24  NOVEL
-    f_coup   = feat_so_spindle_coupling(phys, fs, stages)  # [H]   3  NOVEL
-    f_cplx   = feat_eeg_complexity(phys, fs, stages)       # [I]  12  NOVEL
-    f_frag   = feat_sleep_fragmentation(stages)             # [J]   5  NOVEL
-    f_sef    = feat_spectral_edge(phys, fs, stages)         # [K]   3  NOVEL
-    f_wkurt  = feat_waveform_kurtosis(phys, fs, stages)     # [L]   6  NOVEL
-    f_bkurt  = feat_bandpower_kurtosis(phys, fs, stages)    # [M]  36  NOVEL
-    f_n3rat  = feat_n3_ratios(phys, fs, stages)             # [N]   3  NOVEL
-    f_ysw    = feat_yasa_sw(phys, fs, stages)               # [O]  15  NOVEL
-    f_coh    = feat_eeg_coherence(phys, fs, stages)         # [P]  75  NOVEL
-    f_remrat = feat_rem_spectral_ratios(phys, fs, stages)   # [Q]   9  NOVEL
-    f_sfar   = feat_rem_sfar(phys, fs, stages)              # [R]   3  NOVEL
+    f_spin   = feat_custom_spindles(phys, fs, stages)          # [G]  18  NOVEL
+    f_coup   = feat_so_spindle_coupling(phys, fs, stages)     # [H]   3  NOVEL
+    f_cplx   = feat_eeg_complexity(phys, fs, stages)          # [I]  12  NOVEL
+    f_frag   = feat_sleep_fragmentation(stages)                # [J]   5  NOVEL
+    f_sef    = feat_spectral_edge(phys, fs, stages)            # [K]   3  NOVEL
+    f_wkurt  = feat_waveform_kurtosis(phys, fs, stages)        # [L]   6  NOVEL
+    f_bkurt  = feat_bandpower_kurtosis(phys, fs, stages)       # [M]  36  NOVEL
+    f_n3rat  = feat_n3_ratios(phys, fs, stages)                # [N]   3  NOVEL
+    f_coh    = feat_eeg_coherence(phys, fs, stages)            # [P]  75  NOVEL
+    f_remrat = feat_rem_spectral_ratios(phys, fs, stages)      # [Q]   9  NOVEL
+    f_sfar   = feat_rem_sfar(phys, fs, stages)                 # [R]   3  NOVEL
 
     features = np.concatenate([
         f_demo, f_macro, f_eeg, f_resp, f_hrv, f_prob,
         f_spin, f_coup, f_cplx, f_frag, f_sef,
-        f_wkurt, f_bkurt, f_n3rat, f_ysw,
+        f_wkurt, f_bkurt, f_n3rat,
         f_coh, f_remrat, f_sfar,
     ]).astype(np.float32)
 
@@ -730,6 +779,92 @@ def feat_yasa_sw(phys, fs_dict, stages):
     return out
 
 
+# ─── [G] Custom spindle detection ★ NOVEL ────────────────────────────────────
+#
+# Replaces YASA spindle/slow-wave features (v9).
+# YASA was producing all-zero features due to CHAN000 channel labeling bug,
+# which added noise and hurt AUROC.
+# This implementation uses sigma-band (11-16 Hz) envelope thresholding via scipy.
+# Faster (~0.5s vs 25s per patient), no external dependency.
+# Reference: Lacourse et al. 2019 (basis for YASA's algorithm).
+
+def feat_custom_spindles(phys, fs_dict, stages):
+    """[G] 18 custom spindle features (6 per channel × 3 EEG channels) in N2 sleep.
+
+    Per channel (C3-M2, C4-M1, F3-M2):
+      [0] sigma_power      — log mean sigma band power in N2
+      [1] spindle_density  — events per minute of N2 (threshold: mean+1.5*std)
+      [2] mean_amplitude   — mean peak envelope amplitude during spindle
+      [3] mean_duration    — mean spindle duration (s), valid: 0.5–3.0 s
+      [4] sigma_alpha_ratio — sigma / alpha power in N2
+      [5] sigma_delta_ratio — sigma / delta power in N2
+    """
+    out = np.zeros(18)
+    if len(stages) == 0:
+        return out
+
+    for ch_idx, ch in enumerate(['c3-m2', 'c4-m1', 'f3-m2']):
+        if ch not in phys:
+            continue
+        sig        = phys[ch]
+        eeg_fs     = fs_dict.get(ch, 200.0)
+        epoch_samp = int(EPOCH_SEC * eeg_fs)
+        nperseg    = min(int(eeg_fs * 4), epoch_samp)
+
+        # Collect N2 epochs
+        n2_bufs, n2_count = [], 0
+        for i, sv in enumerate(stages.astype(int)):
+            if sv != S_N2:
+                continue
+            start = i * epoch_samp
+            end   = start + epoch_samp
+            if end > len(sig):
+                break
+            n2_bufs.append(sig[start:end])
+            n2_count += 1
+
+        if not n2_bufs:
+            continue
+
+        n2_concat = np.concatenate(n2_bufs)
+        n2_min    = n2_count * EPOCH_SEC / 60.0
+
+        # PSD for power ratios
+        f, psd = sp_signal.welch(n2_concat, fs=eeg_fs, nperseg=nperseg)
+        def _bp(lo, hi):
+            m = (f >= lo) & (f <= hi)
+            return np.trapz(psd[m], f[m]) if m.any() else 0.0
+
+        sigma_p = _bp(11.0, 16.0)
+        alpha_p = _bp(8.0, 12.0)
+        delta_p = _bp(0.5,  4.0)
+
+        # Sigma envelope for spindle detection
+        sigma_filt = _bandpass(n2_concat, eeg_fs, 11.0, 16.0)
+        sigma_env  = np.abs(sp_signal.hilbert(sigma_filt))
+
+        thresh = np.mean(sigma_env) + 1.5 * np.std(sigma_env)
+        above  = (sigma_env > thresh).astype(int)
+        starts = np.where(np.diff(above, prepend=0) == 1)[0]
+        ends   = np.where(np.diff(above, append=0) == -1)[0]
+
+        min_samp = int(0.5  * eeg_fs)
+        max_samp = int(3.0  * eeg_fs)
+        valid = [(s, e) for s, e in zip(starts, ends)
+                 if min_samp <= (e - s) <= max_samp]
+
+        b = ch_idx * 6
+        out[b+0] = np.log1p(sigma_p)
+        out[b+1] = len(valid) / n2_min if n2_min > 0 else 0.0
+        if valid:
+            out[b+2] = float(np.mean([np.max(sigma_env[s:e]) for s, e in valid]))
+            out[b+3] = float(np.mean([(e - s) / eeg_fs for s, e in valid]))
+        out[b+4] = sigma_p / alpha_p if alpha_p > 0 else 0.0
+        out[b+5] = sigma_p / delta_p if delta_p > 0 else 0.0
+
+    return out
+
+
 # ─── [H] SO-Spindle coupling (Phase-Amplitude Coupling) ★ NOVEL ──────────────
 #
 # Motivation: Slow oscillation (SO, 0.5-2 Hz) — spindle (12-16 Hz) coupling
@@ -1116,7 +1251,8 @@ def feat_eeg_coherence(phys, fs_dict, stages):
                 band_coh = []
                 for _, flo, fhi in COH_BANDS:
                     m = (f >= flo) & (f <= fhi)
-                    band_coh.append(float(np.mean(Cxy[m])) if m.any() else 0.0)
+                    val = float(np.nanmean(Cxy[m])) if m.any() else 0.0
+                    band_coh.append(0.0 if np.isnan(val) else val)
                 accum[sv].append(band_coh)
             except Exception:
                 pass
