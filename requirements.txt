@@ -1,8 +1,10 @@
 edfio==0.4.10
+h5py>=3.9.0
 joblib==1.4.2
 lightgbm>=4.0.0
 numpy==2.0.2
 pandas==2.2.2
+psutil>=5.9.0
 scikit-learn==1.6.0
 scipy==1.13.1
 torch>=2.0.0

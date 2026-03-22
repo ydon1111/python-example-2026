@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # team_code.py — PhysioNet Challenge 2026
 #
-# Feature groups (total = 302):
+# Feature groups (total = 306):
 #   [A]  demographics          10   age, sex×3, race×5, BMI
 #   [B]  sleep macrostructure  12   SL, TST, SE, WASO, stage%, REMlat, trans, TIB
 #   [C]  EEG bandpower         90   3ch × 5stages × 6bands (delta–gamma) — log1p
@@ -29,6 +29,9 @@
 #                                   in REM sleep — thalamo-cortical biomarker
 #   [R]  REM slow-fast ratio    3   log(slow/fast) in REM per EEG channel        *** NOVEL ***
 #                                   SFAR: slow=(delta+theta), fast=(alpha+sigma+beta)
+#   [S]  Philosopher's Stone    4   brain_health_score + total/fluid/crystallized *** NOVEL ***
+#                                   cognition scores — NEJM AI 2026 foundation model
+#                                   trained on 36k PSG from 27k subjects
 #
 # Note: [G] YASA spindles (24) and [O] YASA slow waves (15) removed in v9.
 #       YASA added noise via CHAN000 bug (all-zero features). Replaced with
@@ -82,7 +85,8 @@ SCRIPT_DIR      = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CSV     = os.path.join(SCRIPT_DIR, 'channel_table.csv')
 CACHE_SUBDIR    = 'feature_cache'
 MODEL_FILE      = 'model.sav'
-FEATURE_VERSION = 'v9'   # bump when feature layout changes to invalidate old cache
+FEATURE_VERSION = 'v10'  # bump when feature layout changes to invalidate old cache
+PS_DIR          = '/ps'  # Philosopher's Stone repo path in Docker
 
 # stage_caisr: fs=1/30 Hz → one sample per 30-second PSG epoch
 # Encoding: 1=N3, 2=N2, 3=N1, 4=REM, 5=Wake, 9=Unavailable
@@ -373,12 +377,13 @@ def extract_all_features(record, data_folder, csv_path=DEFAULT_CSV, cache_dir=No
     f_coh    = feat_eeg_coherence(phys, fs, stages)            # [P]  75  NOVEL
     f_remrat = feat_rem_spectral_ratios(phys, fs, stages)      # [Q]   9  NOVEL
     f_sfar   = feat_rem_sfar(phys, fs, stages)                 # [R]   3  NOVEL
+    f_ps     = feat_philosophers_stone(phys, fs, patient_data) # [S]   4  NOVEL
 
     features = np.concatenate([
         f_demo, f_macro, f_eeg, f_resp, f_hrv, f_prob,
         f_spin, f_coup, f_cplx, f_frag, f_sef,
         f_wkurt, f_bkurt, f_n3rat,
-        f_coh, f_remrat, f_sfar,
+        f_coh, f_remrat, f_sfar, f_ps,
     ]).astype(np.float32)
 
     if cache_dir:
@@ -1379,6 +1384,92 @@ def feat_rem_sfar(phys, fs_dict, stages):
 
         if ratios:
             out[ch_idx] = np.mean(ratios)
+
+    return out
+
+
+# ─── [S] Philosopher's Stone Transfer Learning ★ NOVEL ───────────────────────
+#
+# Philosopher's Stone (Ganglberger et al., NEJM AI 2026) is a deep learning
+# model trained on 36,000 PSG recordings from 27,000 subjects (FHS, MESA,
+# MrOS, SOF, KoGES, MGH cohorts).  It produces a 1024-D latent embedding and
+# interpretable brain health scores from overnight C4-M1 EEG.
+# We use the 4 scalar outputs: brain_health_score + 3 cognition scores.
+# Reference: https://github.com/bdsp-core/philosophers-stone
+# Model: huggingface.co/wolfgang-ganglberger/philosophers-stone
+
+def feat_philosophers_stone(phys, fs_dict, patient_data):
+    """[S] 4 Philosopher's Stone features (graceful fallback to zeros if unavailable).
+
+    [0] brain_health_score       — overall brain health index (higher = healthier)
+    [1] total_cognition_score    — predicted overall cognitive performance
+    [2] fluid_cognition_score    — predicted fluid intelligence
+    [3] crystallized_cognition_score — predicted crystallized intelligence
+    """
+    out = np.zeros(4)
+
+    # Only run if PS repo is present (Docker environment)
+    if not os.path.exists(PS_DIR):
+        return out
+
+    ch = 'c4-m1'
+    if ch not in phys:
+        return out
+
+    try:
+        import h5py
+        import subprocess
+        import tempfile
+        import pandas as pd
+
+        sig    = phys[ch].astype(np.float32)
+        eeg_fs = fs_dict.get(ch, 200.0)
+
+        age     = load_age(patient_data)
+        if np.isnan(float(age)) or float(age) <= 0:
+            age = 65.0
+        sex_str = load_sex(patient_data)
+        sex     = 1 if sex_str == 'Male' else 0
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # ── Write C4-M1 signal as HDF5 ──────────────────────────────────
+            h5_path = os.path.join(tmpdir, 'eeg.h5')
+            with h5py.File(h5_path, 'w') as f:
+                ds = f.create_dataset('signals/c4-m1', data=sig)
+                ds.attrs['sampling_rate'] = float(eeg_fs)
+                ds.attrs['unit_voltage']  = 'uV'
+
+            # ── Write manifest CSV ───────────────────────────────────────────
+            manifest_path = os.path.join(tmpdir, 'manifest.csv')
+            pd.DataFrame([{
+                'filepath': h5_path,
+                'age':      float(age),
+                'sex':      int(sex),
+            }]).to_csv(manifest_path, index=False)
+
+            # ── Run philosopher.py from PS_DIR ───────────────────────────────
+            # Output: PS_DIR/phi_out/phi_results.csv (relative to cwd)
+            subprocess.run(
+                ['python', 'philosopher.py', '--manifest_csv', manifest_path],
+                capture_output=True, text=True,
+                timeout=180, cwd=PS_DIR,
+            )
+
+            # ── Parse output ─────────────────────────────────────────────────
+            results_csv = os.path.join(PS_DIR, 'phi_out', 'phi_results.csv')
+            if os.path.exists(results_csv):
+                df  = pd.read_csv(results_csv)
+                if len(df) > 0:
+                    row    = df.iloc[0]
+                    out[0] = float(row.get('brain_health_score',          0.0) or 0.0)
+                    out[1] = float(row.get('total_cognition_score',        0.0) or 0.0)
+                    out[2] = float(row.get('fluid_cognition_score',        0.0) or 0.0)
+                    out[3] = float(row.get('crystallized_cognition_score', 0.0) or 0.0)
+                # Clean up output file so next patient starts fresh
+                os.remove(results_csv)
+
+    except Exception:
+        pass   # graceful fallback — zeros indicate PS unavailable
 
     return out
 
