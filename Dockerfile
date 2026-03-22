@@ -11,7 +11,12 @@ WORKDIR /challenge
 RUN pip install -r requirements.txt
 
 ## Philosopher's Stone (NEJM AI 2026) — transfer learning from 36k PSG recordings
-RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
+## Use archived repos (Debian Buster is EOL)
+RUN echo "deb http://archive.debian.org/debian buster main contrib non-free" > /etc/apt/sources.list && \
+    echo "deb http://archive.debian.org/debian-security buster/updates main" >> /etc/apt/sources.list && \
+    apt-get -o Acquire::Check-Valid-Until=false update && \
+    apt-get install -y git && \
+    rm -rf /var/lib/apt/lists/*
 RUN git clone https://github.com/bdsp-core/philosophers-stone /ps
 
 ## Install PS-specific dependencies (others already in requirements.txt)
