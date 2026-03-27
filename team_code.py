@@ -85,8 +85,18 @@ SCRIPT_DIR      = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CSV     = os.path.join(SCRIPT_DIR, 'channel_table.csv')
 CACHE_SUBDIR    = 'feature_cache'
 MODEL_FILE      = 'model.sav'
-FEATURE_VERSION = 'v10'  # bump when feature layout changes to invalidate old cache
+FEATURE_VERSION = 'v21'  # bump when feature layout changes to invalidate old cache
 PS_DIR          = '/ps'  # Philosopher's Stone repo path in Docker
+PS_CACHE_FILE   = 'ps_cache.csv'  # pre-computed PS scores saved in model_folder
+PS_BAKED_CACHE  = os.path.join(SCRIPT_DIR, 'ps_cache_baked.csv')  # baked into Docker image
+PS_N_PCA        = 20    # PCA components from 1024-D latent → explains ~90% variance
+PS_FEAT_DIM     = 4 + PS_N_PCA   # total PS features (4 scalars + 20 PCA components)
+
+# ── Philosopher's Stone batch cache (populated during train_model) ──────────
+# dict: '{pid}_ses-{ses}' → np.array(1028,) = [4 scores | 1024 latents]
+# None = not yet loaded (inference path); dict = pre-computed (training path)
+_PS_CACHE = None  # type: ignore[assignment]
+_PS_PCA   = None  # sklearn PCA fitted on training latents; saved in model.sav
 
 # stage_caisr: fs=1/30 Hz → one sample per 30-second PSG epoch
 # Encoding: 1=N3, 2=N2, 3=N1, 4=REM, 5=Wake, 9=Unavailable
@@ -143,7 +153,10 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
     cache_dir = os.path.join(model_folder, CACHE_SUBDIR)
     os.makedirs(cache_dir, exist_ok=True)
 
-    features, labels = [], []
+    # ── Pre-compute PS features once for all records ──────────────────────────
+    _precompute_ps_batch(data_folder, model_folder, records, verbose=verbose)
+
+    features, labels, sites = [], [], []
     pbar = tqdm(records, desc='Extracting', disable=not verbose)
     for rec in pbar:
         pid = rec[HEADERS['bids_folder']]
@@ -152,16 +165,18 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
             label = load_diagnoses(demo_file, pid)
             features.append(X)
             labels.append(label)
+            sites.append(rec.get(HEADERS['site_id'], 'S0001'))
         except Exception as e:
             tqdm.write(f'  ! {pid}: {e}')
 
-    X_arr = np.array(features, dtype=np.float32)
-    y_arr = np.array(labels,   dtype=int)
+    X_arr    = np.array(features, dtype=np.float32)
+    y_arr    = np.array(labels,   dtype=int)
+    site_arr = np.array(sites)
 
     if verbose:
         print(f'[train] X={X_arr.shape} | pos={y_arr.sum()} neg={(y_arr==0).sum()}')
 
-    from sklearn.model_selection import StratifiedKFold
+    from sklearn.model_selection import StratifiedKFold, cross_val_score
     from sklearn.metrics import roc_auc_score
     from sklearn.ensemble import RandomForestClassifier, ExtraTreesClassifier, StackingClassifier
     from sklearn.linear_model import LogisticRegression
@@ -169,29 +184,74 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
     from sklearn.pipeline import Pipeline
     from sklearn.base import clone
 
+    # ── Optuna: tune LightGBM + feature-selection threshold ──────────────────
+    _best_lgbm_params = {}
+    _best_fs_pct      = 40
+    if HAS_LGBM:
+        try:
+            import optuna
+            optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+            def _lgbm_objective(trial):
+                p = dict(
+                    n_estimators      = 800,
+                    learning_rate     = 0.02,
+                    num_leaves        = trial.suggest_int('num_leaves', 10, 63),
+                    min_child_samples = trial.suggest_int('min_child_samples', 10, 80),
+                    reg_lambda        = trial.suggest_float('reg_lambda', 0.1, 20.0, log=True),
+                    reg_alpha         = trial.suggest_float('reg_alpha', 0.01, 2.0, log=True),
+                    colsample_bytree  = trial.suggest_float('colsample_bytree', 0.4, 0.9),
+                    subsample         = trial.suggest_float('subsample', 0.5, 0.9),
+                    subsample_freq    = 1,
+                    random_state      = 42, n_jobs=1, verbose=-1,
+                )
+                fs_pct = trial.suggest_int('fs_pct', 25, 55)
+                clf_fs = lgb.LGBMClassifier(**p)
+                clf_fs.fit(X_arr, y_arr)
+                imp = clf_fs.feature_importances_
+                mask = imp >= np.percentile(imp, fs_pct)
+                Xs = X_arr[:, mask]
+                clf = lgb.LGBMClassifier(**p)
+                skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+                return cross_val_score(clf, Xs, y_arr, cv=skf,
+                                       scoring='roc_auc', n_jobs=-1).mean()
+
+            study = optuna.create_study(
+                direction='maximize',
+                sampler=optuna.samplers.TPESampler(seed=42),
+            )
+            study.optimize(_lgbm_objective, n_trials=30,
+                           show_progress_bar=verbose)
+            _best_lgbm_params = {k: v for k, v in study.best_params.items()
+                                  if k != 'fs_pct'}
+            _best_fs_pct = study.best_params.get('fs_pct', 40)
+            _best_lgbm_params.update(dict(n_estimators=800, learning_rate=0.02,
+                                          subsample_freq=1, random_state=42,
+                                          n_jobs=-1, verbose=-1))
+            if verbose:
+                print(f'[Optuna] Best CV AUROC={study.best_value:.4f} | '
+                      f'fs_pct={_best_fs_pct} | params={study.best_params}')
+        except Exception as e:
+            if verbose:
+                print(f'[Optuna] Skipped ({e})')
+
     # ── Base model factories ──────────────────────────────────────────────────
+    _lgbm_defaults = dict(
+        n_estimators=800, num_leaves=31, learning_rate=0.02,
+        min_child_samples=30, subsample=0.8, subsample_freq=1,
+        colsample_bytree=0.7, reg_alpha=0.2, reg_lambda=3.0,
+        random_state=42, n_jobs=-1, verbose=-1,
+    )
+
     def _make_lgbm():
         if HAS_LGBM:
-            return lgb.LGBMClassifier(
-                n_estimators=800,
-                num_leaves=31,
-                learning_rate=0.02,
-                min_child_samples=30,
-                subsample=0.8,
-                subsample_freq=1,
-                colsample_bytree=0.7,
-                reg_alpha=0.2,
-                reg_lambda=3.0,
-                random_state=42,
-                n_jobs=-1,
-                verbose=-1,
-            )
-        else:
-            from sklearn.ensemble import GradientBoostingClassifier
-            return GradientBoostingClassifier(
-                n_estimators=500, max_depth=4,
-                learning_rate=0.02, subsample=0.8, random_state=42,
-            )
+            params = _best_lgbm_params if _best_lgbm_params else _lgbm_defaults
+            return lgb.LGBMClassifier(**params)
+        from sklearn.ensemble import GradientBoostingClassifier
+        return GradientBoostingClassifier(
+            n_estimators=500, max_depth=4,
+            learning_rate=0.02, subsample=0.8, random_state=42,
+        )
 
     def _make_xgb():
         if HAS_XGB:
@@ -243,7 +303,7 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
     clf_fs = _make_lgbm()
     clf_fs.fit(X_arr, y_arr)
     importances = clf_fs.feature_importances_
-    threshold   = np.percentile(importances, 40)
+    threshold   = np.percentile(importances, _best_fs_pct)
     feat_mask   = importances >= threshold
     X_sel       = X_arr[:, feat_mask]
     if verbose:
@@ -277,8 +337,10 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
     if verbose:
         print(f'[CV] 5-fold CV | {len(estimators)} base models ...')
     skf  = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    # Site-stratified: combine site+diagnosis so folds are balanced per site
+    strat_labels = np.array([f"{s}_{l}" for s, l in zip(site_arr, y_arr)])
     aucs = []
-    for fold, (tr_idx, val_idx) in enumerate(skf.split(X_sel, y_arr), 1):
+    for fold, (tr_idx, val_idx) in enumerate(skf.split(X_sel, strat_labels), 1):
         fold_stack = StackingClassifier(
             estimators=[(n, clone(m)) for n, m in estimators],
             final_estimator=clone(final_estimator),
@@ -303,6 +365,7 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
         'stack':           stack,
         'feat_mask':       feat_mask,
         'feature_version': FEATURE_VERSION,
+        'ps_pca':          _PS_PCA,
     }, os.path.join(model_folder, MODEL_FILE))
 
     if verbose:
@@ -314,6 +377,8 @@ def load_model(model_folder, verbose):
 
 
 def run_model(model, record, data_folder, verbose):
+    global _PS_PCA
+    _PS_PCA   = model.get('ps_pca')   # restore PCA transform for inference
     stack     = model['stack']
     feat_mask = model.get('feat_mask')
 
@@ -328,6 +393,42 @@ def run_model(model, record, data_folder, verbose):
 
 
 # ─── Feature Extraction ───────────────────────────────────────────────────────
+
+
+def feat_half_night_spectral(phys, fs_dict, stages):
+    """[T] 12 features: delta/theta/alpha/sigma power ratio (2nd half / 1st half)
+    for c4-m1, plus absolute powers in each half.  Captures how EEG evolves
+    through the night — slow-wave sleep pressure changes differ in CI."""
+    out = np.zeros(12, dtype=np.float32)
+    ch  = 'c4-m1'
+    if ch not in phys:
+        return out
+    sig  = phys[ch].astype(np.float32)
+    eeg_fs = float(fs_dict.get(ch, 200.0))
+    n    = len(sig)
+    if n < int(eeg_fs * 3600):   # need at least 1 hour
+        return out
+    mid  = n // 2
+    bands = {'delta': (0.5, 4), 'theta': (4, 8), 'alpha': (8, 13), 'sigma': (11, 16)}
+    try:
+        from scipy.signal import welch
+        for bi, (bname, (lo, hi)) in enumerate(bands.items()):
+            def _bp(x):
+                nperseg = min(int(eeg_fs * 4), len(x) // 4)
+                if nperseg < 16:
+                    return 0.0
+                f, pxx = welch(x, fs=eeg_fs, nperseg=nperseg)
+                m = (f >= lo) & (f < hi)
+                return float(np.log1p(pxx[m].mean())) if m.any() else 0.0
+            p1 = _bp(sig[:mid])
+            p2 = _bp(sig[mid:])
+            out[bi * 3]     = p1
+            out[bi * 3 + 1] = p2
+            out[bi * 3 + 2] = p2 - p1   # change: positive = power increases in 2nd half
+    except Exception:
+        pass
+    return out
+
 
 def extract_all_features(record, data_folder, csv_path=DEFAULT_CSV, cache_dir=None):
     """Returns float32 array of shape (N_FEATURES,) = (162,)."""
@@ -377,13 +478,14 @@ def extract_all_features(record, data_folder, csv_path=DEFAULT_CSV, cache_dir=No
     f_coh    = feat_eeg_coherence(phys, fs, stages)            # [P]  75  NOVEL
     f_remrat = feat_rem_spectral_ratios(phys, fs, stages)      # [Q]   9  NOVEL
     f_sfar   = feat_rem_sfar(phys, fs, stages)                 # [R]   3  NOVEL
-    f_ps     = feat_philosophers_stone(phys, fs, patient_data) # [S]   4  NOVEL
+    # f_ps disabled (PS features showed no AUROC gain in ablation)
+    f_halves = feat_half_night_spectral(phys, fs, stages)      # [T]  12  NOVEL
 
     features = np.concatenate([
         f_demo, f_macro, f_eeg, f_resp, f_hrv, f_prob,
         f_spin, f_coup, f_cplx, f_frag, f_sef,
         f_wkurt, f_bkurt, f_n3rat,
-        f_coh, f_remrat, f_sfar, f_ps,
+        f_coh, f_remrat, f_sfar, f_halves,
     ]).astype(np.float32)
 
     if cache_dir:
@@ -455,7 +557,7 @@ def _bandpass(sig, fs, lo, hi):
 # ─── [A] Demographics ─────────────────────────────────────────────────────────
 
 def feat_demographics(data):
-    """10 features: age(1) + sex×3 + race×5 + BMI(1)."""
+    """13 features: age(1) + sex×3 + race×5 + BMI(1) + site×3."""
     age = np.array([load_age(data)], dtype=float)
 
     sex_vec = np.zeros(3)
@@ -466,7 +568,12 @@ def feat_demographics(data):
     race_vec[{'asian':0,'black':1,'others':2,'unavailable':3,'white':4}.get(race_key, 2)] = 1.0
 
     bmi = np.array([load_bmi(data)], dtype=float)
-    return np.concatenate([age, sex_vec, race_vec, bmi])
+
+    site_vec = np.zeros(3, dtype=np.float32)
+    site_id  = str(data.get('SiteID', ''))
+    site_vec[{'S0001': 0, 'I0006': 1, 'I0002': 2}.get(site_id, 0)] = 1.0
+
+    return np.concatenate([age, sex_vec, race_vec, bmi, site_vec])
 
 
 # ─── [B] Sleep macrostructure ─────────────────────────────────────────────────
@@ -1398,78 +1505,337 @@ def feat_rem_sfar(phys, fs_dict, stages):
 # Reference: https://github.com/bdsp-core/philosophers-stone
 # Model: huggingface.co/wolfgang-ganglberger/philosophers-stone
 
-def feat_philosophers_stone(phys, fs_dict, patient_data):
-    """[S] 4 Philosopher's Stone features (graceful fallback to zeros if unavailable).
+def _ps_write_h5(sig, eeg_fs, h5_path):
+    """Write a single-channel EEG signal in PS-compatible HDF5 format.
 
-    [0] brain_health_score       — overall brain health index (higher = healthier)
-    [1] total_cognition_score    — predicted overall cognitive performance
-    [2] fluid_cognition_score    — predicted fluid intelligence
-    [3] crystallized_cognition_score — predicted crystallized intelligence
+    PS requires exactly 200 Hz; resample if the source differs.
     """
-    out = np.zeros(4)
+    import h5py
+    from math import gcd
+    from scipy.signal import resample_poly
 
-    # Only run if PS repo is present (Docker environment)
+    sig = sig.astype(np.float32)
+    target_fs = 200
+    src_fs = int(round(eeg_fs))
+    if src_fs != target_fs:
+        g = gcd(src_fs, target_fs)
+        sig = resample_poly(sig, target_fs // g, src_fs // g).astype(np.float32)
+    # Cap at 6h at 200 Hz: peak RSS scales with length.
+    # 7.23h -> 32.51 GB peak, exceeds Docker 31 GB limit; 6h -> ~27 GB.
+    sig = sig[:6 * 3600 * 200]
+
+    with h5py.File(h5_path, 'w') as f:
+        f.create_dataset('signals/c4-m1', data=sig.reshape(-1, 1))
+        f.attrs['sampling_rate'] = 200.0  # always 200 Hz after resampling
+        f.attrs['unit_voltage']  = 'uV'
+
+
+def _precompute_ps_batch(data_folder, model_folder, records, verbose=True):
+    """Run Philosopher's Stone on all records in ONE subprocess call.
+
+    Results are saved to <model_folder>/ps_cache.csv and loaded into _PS_CACHE.
+    H5 files and philosopher.py output are written to <model_folder>/ps_batch/
+    (persistent across runs) so that partial results survive timeout/crash.
+    """
+    global _PS_CACHE, _PS_PCA
+    import pandas as pd
+    import subprocess
+    from sklearn.decomposition import PCA
+
+    cache_csv = os.path.join(model_folder, PS_CACHE_FILE)
+    lhl_cols  = [f'lhl_{i}' for i in range(1, 1025)]
+
+    def _load_cache_df(path):
+        """Load cache CSV and return (dict, pca) with latents + fitted PCA."""
+        df = pd.read_csv(path)
+        cache = {}
+        latents_list = []
+        keys_list    = []
+        for _, row in df.iterrows():
+            scores = np.array([
+                float(row.get('brain_health_score',          0.0) or 0.0),
+                float(row.get('total_cognition_score',        0.0) or 0.0),
+                float(row.get('fluid_cognition_score',        0.0) or 0.0),
+                float(row.get('crystallized_cognition_score', 0.0) or 0.0),
+            ], dtype=np.float32)
+            has_latent = any(c in df.columns for c in ['lhl_1', 'lhl_2'])
+            if has_latent:
+                latent = np.array([float(row.get(c, 0.0) or 0.0) for c in lhl_cols],
+                                  dtype=np.float32)
+                cache[row['patient_key']] = np.concatenate([scores, latent])
+                latents_list.append(latent)
+                keys_list.append(row['patient_key'])
+            else:
+                cache[row['patient_key']] = scores
+        pca = None
+        if latents_list:
+            pca = PCA(n_components=min(PS_N_PCA, len(latents_list)))
+            pca.fit(np.stack(latents_list))
+        return cache, pca
+
+    # Fast path 1: model_folder cache
+    if os.path.exists(cache_csv):
+        _PS_CACHE, _PS_PCA = _load_cache_df(cache_csv)
+        if verbose:
+            has_lat = any(v.shape[0] > 4 for v in _PS_CACHE.values())
+            print(f'[PS] Loaded {len(_PS_CACHE)} pre-computed PS features from cache '
+                  f'({"with" if has_lat else "without"} latents).')
+        return
+
+    # Fast path 2: baked-in cache (Docker image)
+    if os.path.exists(PS_BAKED_CACHE):
+        if verbose:
+            print(f'[PS] Loading baked PS cache from {PS_BAKED_CACHE}...')
+        _PS_CACHE, _PS_PCA = _load_cache_df(PS_BAKED_CACHE)
+        # Copy baked cache to model_folder for future runs
+        import shutil
+        shutil.copy2(PS_BAKED_CACHE, cache_csv)
+        if verbose:
+            print(f'[PS] Loaded {len(_PS_CACHE)} patients from baked cache.')
+        return
+
     if not os.path.exists(PS_DIR):
-        return out
+        _PS_CACHE = {}
+        return
+
+    demo_file = os.path.join(data_folder, DEMOGRAPHICS_FILE)
+    if verbose:
+        print(f'[PS] Pre-computing Philosopher Stone features for {len(records)} patients...')
+
+    # Use a persistent directory so partial results survive timeout/crash
+    batch_dir = os.path.join(model_folder, 'ps_batch')
+    os.makedirs(batch_dir, exist_ok=True)
+
+    manifest_rows = []
+    filepath_to_key = {}
+
+    for rec in tqdm(records, desc='[PS] H5', disable=not verbose):
+        pid = rec[HEADERS['bids_folder']]
+        sid = rec[HEADERS['site_id']]
+        ses = rec[HEADERS['session_id']]
+        key = f'{pid}_ses-{ses}'
+
+        phys_path = os.path.join(
+            data_folder, PHYSIOLOGICAL_DATA_SUBFOLDER,
+            sid, f'{pid}_ses-{ses}.edf')
+        if not os.path.exists(phys_path):
+            continue
+
+        try:
+            patient_data = load_demographics(demo_file, pid, ses)
+            age = load_age(patient_data)
+            if np.isnan(float(age)) or float(age) <= 0:
+                age = 65.0
+            sex = 1 if load_sex(patient_data) == 'Male' else 0
+
+            phys_raw, phys_fs_raw = load_signal_data(phys_path)
+            phys, fs = _build_channel_dict(phys_raw, phys_fs_raw, DEFAULT_CSV)
+            if 'c4-m1' not in phys:
+                continue
+
+            h5_path = os.path.join(batch_dir, f'{key}.h5')
+            if not os.path.exists(h5_path):
+                _ps_write_h5(phys['c4-m1'], fs.get('c4-m1', 200.0), h5_path)
+
+            manifest_rows.append({'filepath': h5_path, 'age': float(age), 'sex': int(sex)})
+            filepath_to_key[h5_path] = key
+        except Exception as e:
+            if verbose:
+                tqdm.write(f'  ! [PS] {pid}: {e}')
+
+    if not manifest_rows:
+        _PS_CACHE = {}
+        return
+
+    manifest_csv = os.path.join(batch_dir, 'manifest.csv')
+    pd.DataFrame(manifest_rows).to_csv(manifest_csv, index=False)
+
+    results_csv = os.path.join(batch_dir, 'phi_results.csv')
+
+    # Resume: skip already-processed patients if phi_results.csv exists
+    existing_res_df = pd.read_csv(results_csv) if os.path.exists(results_csv) else pd.DataFrame()
+    already_done = set(existing_res_df['filepath'].astype(str)) if not existing_res_df.empty else set()
+
+    remaining_rows = [r for r in manifest_rows if r['filepath'] not in already_done]
+    if verbose:
+        print(f'[PS] {len(already_done)} already done, {len(remaining_rows)} remaining.')
+
+    if remaining_rows:
+        remaining_csv = os.path.join(batch_dir, 'manifest_remaining.csv')
+        pd.DataFrame(remaining_rows).to_csv(remaining_csv, index=False)
+        # philosopher.py appends to phi_results.csv when it already exists
+        # We rename existing so philosopher writes a fresh file, then we merge
+        phi_partial = results_csv + '.partial'
+        if os.path.exists(results_csv):
+            os.rename(results_csv, phi_partial)
+
+        if verbose:
+            print(f'[PS] Running philosopher.py on {len(remaining_rows)} records (~{len(remaining_rows)*100//3600}h)...')
+
+        try:
+            subprocess.run(
+                ['python', 'philosopher.py',
+                 '--manifest_csv', remaining_csv,
+                 '--outdir', batch_dir,
+                 '--no-save-plots', '--no-save-json'],
+                capture_output=False,
+                timeout=3600 * 30,
+                cwd=PS_DIR,
+            )
+        except subprocess.TimeoutExpired:
+            if verbose:
+                print('[PS] philosopher.py timed out — using partial results.')
+        except Exception as e:
+            if verbose:
+                print(f'[PS] philosopher.py error: {e}')
+
+        # Merge partial + new results
+        frames = []
+        if os.path.exists(phi_partial):
+            frames.append(pd.read_csv(phi_partial))
+        if os.path.exists(results_csv):
+            frames.append(pd.read_csv(results_csv))
+        if frames:
+            merged = pd.concat(frames, ignore_index=True).drop_duplicates(subset=['filepath'], keep='last')
+            merged.to_csv(results_csv, index=False)
+        elif os.path.exists(phi_partial):
+            os.rename(phi_partial, results_csv)
+
+    # Read whatever results exist (full or partial); include latent vectors
+    _PS_CACHE = {}
+    rows_out  = []
+    latents_list = []
+    keys_list    = []
+    if os.path.exists(results_csv):
+        res_df = pd.read_csv(results_csv)
+        for _, r in res_df.iterrows():
+            fp  = str(r.get('filepath', ''))
+            key = filepath_to_key.get(fp)
+            if key is None:
+                continue
+            scores = np.array([
+                float(r.get('brain_health_score',          0.0) or 0.0),
+                float(r.get('total_cognition_score',        0.0) or 0.0),
+                float(r.get('fluid_cognition_score',        0.0) or 0.0),
+                float(r.get('crystallized_cognition_score', 0.0) or 0.0),
+            ], dtype=np.float32)
+            latent = np.array([float(r.get(f'lhl_{i}', 0.0) or 0.0) for i in range(1, 1025)],
+                              dtype=np.float32)
+            _PS_CACHE[key] = np.concatenate([scores, latent])
+            latents_list.append(latent)
+            keys_list.append(key)
+            row_d = {'patient_key': key,
+                     'brain_health_score':          scores[0],
+                     'total_cognition_score':        scores[1],
+                     'fluid_cognition_score':        scores[2],
+                     'crystallized_cognition_score': scores[3]}
+            for i, v in enumerate(latent, 1):
+                row_d[f'lhl_{i}'] = float(v)
+            rows_out.append(row_d)
+    else:
+        if verbose:
+            print('[PS] philosopher.py produced no results CSV.')
+
+    # Fit PCA on all collected latents
+    if latents_list:
+        _PS_PCA = PCA(n_components=min(PS_N_PCA, len(latents_list)))
+        _PS_PCA.fit(np.stack(latents_list))
+        if verbose:
+            var = float(_PS_PCA.explained_variance_ratio_.sum())
+            print(f'[PS] PCA fitted on {len(latents_list)} latents '
+                  f'({PS_N_PCA} components → {var:.1%} variance).')
+
+    pd.DataFrame(rows_out).to_csv(cache_csv, index=False)
+    if verbose:
+        print(f'[PS] Saved {len(_PS_CACHE)} PS features → {cache_csv}')
+
+def _apply_ps_pca(cached):
+    """Convert cached 1028-D array [4 scores | 1024 latents] → PS_FEAT_DIM array."""
+    out = np.zeros(PS_FEAT_DIM, dtype=np.float32)
+    out[:4] = cached[:4]
+    if _PS_PCA is not None and len(cached) > 4:
+        latent = cached[4:].reshape(1, -1)
+        pca_vec = _PS_PCA.transform(latent)[0].astype(np.float32)
+        n = min(len(pca_vec), PS_N_PCA)
+        out[4:4+n] = pca_vec[:n]
+    return out
+
+
+def feat_philosophers_stone(phys, fs_dict, patient_data):
+    """[S] PS_FEAT_DIM Philosopher's Stone features (graceful fallback to zeros).
+
+    Returns 4 scalar scores + PS_N_PCA PCA components of the 1024-D latent vector.
+
+    Training path: reads pre-computed values from _PS_CACHE + applies _PS_PCA.
+    Inference path: runs philosopher.py subprocess, applies saved _PS_PCA.
+    """
+    out = np.zeros(PS_FEAT_DIM, dtype=np.float32)
 
     ch = 'c4-m1'
     if ch not in phys:
         return out
 
+    # ── Training path: use pre-computed cache ─────────────────────────────
+    global _PS_CACHE
+    if _PS_CACHE is not None:
+        pid = patient_data.get(HEADERS['bids_folder'], '')
+        ses = patient_data.get(HEADERS['session_id'], '')
+        key = f'{pid}_ses-{ses}'
+        cached = _PS_CACHE.get(key)
+        if cached is not None:
+            return _apply_ps_pca(cached)
+        return out  # missing from cache → zeros (graceful)
+
+    # ── Inference path: single subprocess call (PS model loaded once) ─────
+    if not os.path.exists(PS_DIR):
+        return out
+
     try:
-        import h5py
         import subprocess
         import tempfile
         import pandas as pd
 
         sig    = phys[ch].astype(np.float32)
         eeg_fs = fs_dict.get(ch, 200.0)
-
-        age     = load_age(patient_data)
+        age    = load_age(patient_data)
         if np.isnan(float(age)) or float(age) <= 0:
             age = 65.0
-        sex_str = load_sex(patient_data)
-        sex     = 1 if sex_str == 'Male' else 0
+        sex = 1 if load_sex(patient_data) == 'Male' else 0
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            # ── Write C4-M1 signal as HDF5 ──────────────────────────────────
             h5_path = os.path.join(tmpdir, 'eeg.h5')
-            with h5py.File(h5_path, 'w') as f:
-                ds = f.create_dataset('signals/c4-m1', data=sig)
-                ds.attrs['sampling_rate'] = float(eeg_fs)
-                ds.attrs['unit_voltage']  = 'uV'
+            _ps_write_h5(sig, eeg_fs, h5_path)
 
-            # ── Write manifest CSV ───────────────────────────────────────────
-            manifest_path = os.path.join(tmpdir, 'manifest.csv')
-            pd.DataFrame([{
-                'filepath': h5_path,
-                'age':      float(age),
-                'sex':      int(sex),
-            }]).to_csv(manifest_path, index=False)
+            manifest_csv = os.path.join(tmpdir, 'manifest.csv')
+            pd.DataFrame([{'filepath': h5_path, 'age': float(age), 'sex': int(sex)}]).to_csv(
+                manifest_csv, index=False)
 
-            # ── Run philosopher.py from PS_DIR ───────────────────────────────
-            # Output: PS_DIR/phi_out/phi_results.csv (relative to cwd)
             subprocess.run(
-                ['python', 'philosopher.py', '--manifest_csv', manifest_path],
+                ['python', 'philosopher.py',
+                 '--manifest_csv', manifest_csv,
+                 '--outdir', tmpdir,
+                 '--no-save-plots', '--no-save-json'],
                 capture_output=True, text=True,
-                timeout=180, cwd=PS_DIR,
+                timeout=300, cwd=PS_DIR,
             )
 
-            # ── Parse output ─────────────────────────────────────────────────
-            results_csv = os.path.join(PS_DIR, 'phi_out', 'phi_results.csv')
+            results_csv = os.path.join(tmpdir, 'phi_results.csv')
             if os.path.exists(results_csv):
                 df  = pd.read_csv(results_csv)
                 if len(df) > 0:
                     row    = df.iloc[0]
-                    out[0] = float(row.get('brain_health_score',          0.0) or 0.0)
-                    out[1] = float(row.get('total_cognition_score',        0.0) or 0.0)
-                    out[2] = float(row.get('fluid_cognition_score',        0.0) or 0.0)
-                    out[3] = float(row.get('crystallized_cognition_score', 0.0) or 0.0)
-                # Clean up output file so next patient starts fresh
-                os.remove(results_csv)
-
+                    scores = np.array([
+                        float(row.get('brain_health_score',          0.0) or 0.0),
+                        float(row.get('total_cognition_score',        0.0) or 0.0),
+                        float(row.get('fluid_cognition_score',        0.0) or 0.0),
+                        float(row.get('crystallized_cognition_score', 0.0) or 0.0),
+                    ], dtype=np.float32)
+                    latent = np.array([float(row.get(f'lhl_{i}', 0.0) or 0.0)
+                                       for i in range(1, 1025)], dtype=np.float32)
+                    cached = np.concatenate([scores, latent])
+                    out = _apply_ps_pca(cached)
     except Exception:
-        pass   # graceful fallback — zeros indicate PS unavailable
+        pass  # graceful fallback — zeros indicate PS unavailable
 
     return out
 

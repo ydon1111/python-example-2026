@@ -11,6 +11,8 @@ scikit-learn==1.6.0
 scipy==1.13.1
 ssqueezepy>=0.6.5
 torch>=2.0.0
+torchvision>=0.15.0
 tqdm==4.67.1
 xgboost>=2.0.0
 yasa>=0.6.0
+optuna>=3.0.0
