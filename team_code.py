@@ -1,12 +1,13 @@
 #!/usr/bin/env python
 # team_code.py — PhysioNet Challenge 2026
 #
-# Feature groups (total = 306):
-#   [A]  demographics          10   age, sex×3, race×5, BMI
+# Feature groups (total = 341):
+#   [A]  demographics          13   age, sex×3, race×5, BMI, site×3
 #   [B]  sleep macrostructure  12   SL, TST, SE, WASO, stage%, REMlat, trans, TIB
 #   [C]  EEG bandpower         90   3ch × 5stages × 6bands (delta–gamma) — log1p
 #   [D]  resp / SpO2            8   AHI, arousal_idx, PLMI, SpO2 stats, ODI
-#   [E]  ECG HRV                6   mean_RR, SDNN, RMSSD, HR, pNN50, NN_range
+#   [E]  ECG HRV                9   mean_RR, SDNN, RMSSD, HR, pNN50, NN_range,   *** v22 ***
+#                                   log_LF, log_HF, LF/HF ratio (freq domain)
 #   [F]  CAISR probabilities    5   prob_w/n3/n2/n1/r
 #   [G]  Custom spindles        18  6 feats × 3ch — sigma-band envelope det.    *** NOVEL ***
 #                                   sigma_power, density, amplitude, duration,
@@ -21,6 +22,9 @@
 #   [M]  band power kurtosis   36   kurt(band power across epochs)               *** NOVEL ***
 #                                   3ch × 3stages(N1,N2,N3) × 4bands
 #   [N]  N3 spectral ratios     3   delta/alpha, delta/theta, sigma/delta (N3)   *** NOVEL ***
+#   [O]  Custom slow waves      15  5 feats × 3ch — SO envelope det. N2+N3       *** v22 ***
+#                                   density, neg_amp, pos_amp, ptp, slope
+#                                   Mander et al. Nature Neurosci 2015
 #   [P]  EEG coherence         75   3pairs × 5bands × 5stages (MSC)             *** NOVEL ***
 #                                   pairs: C3-C4, C3-F3, C4-F3
 #                                   bands: delta,theta,alpha,sigma,beta
@@ -29,18 +33,14 @@
 #                                   in REM sleep — thalamo-cortical biomarker
 #   [R]  REM slow-fast ratio    3   log(slow/fast) in REM per EEG channel        *** NOVEL ***
 #                                   SFAR: slow=(delta+theta), fast=(alpha+sigma+beta)
-#   [S]  Philosopher's Stone    4   brain_health_score + total/fluid/crystallized *** NOVEL ***
-#                                   cognition scores — NEJM AI 2026 foundation model
-#                                   trained on 36k PSG from 27k subjects
+#   [S]  Philosopher's Stone    4   brain_health_score + total/fluid/crystallized *** v22 ***
+#                                   cognition scores only (no latents) — NEJM AI 2026
+#   [T]  half-night spectral   12   delta/theta/alpha/sigma power ratio 1st/2nd half
 #
-# Note: [G] YASA spindles (24) and [O] YASA slow waves (15) removed in v9.
-#       YASA added noise via CHAN000 bug (all-zero features). Replaced with
-#       fast scipy-based custom spindle detection.
-#
-# Model: 4-model Stacking Ensemble (v9)
-#   Level-0: LightGBM, XGBoost, ExtraTrees, RandomForest
-#   Level-1: LogisticRegression (learns optimal combination via 5-fold OOF)
-#   Feature selection: drop bottom 40% by LightGBM importance before stacking
+# Model: 5-model Stacking Ensemble (v22)
+#   Level-0: LightGBM, XGBoost, ExtraTrees, RandomForest, LogisticRegression
+#   Level-1: LogisticRegression (passthrough=True, 5-fold OOF)
+#   Feature selection: Optuna-tuned threshold by LightGBM importance
 
 import joblib
 import numpy as np
@@ -85,7 +85,7 @@ SCRIPT_DIR      = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CSV     = os.path.join(SCRIPT_DIR, 'channel_table.csv')
 CACHE_SUBDIR    = 'feature_cache'
 MODEL_FILE      = 'model.sav'
-FEATURE_VERSION = 'v21'  # bump when feature layout changes to invalidate old cache
+FEATURE_VERSION = 'v22'  # bump when feature layout changes to invalidate old cache
 PS_DIR          = '/ps'  # Philosopher's Stone repo path in Docker
 PS_CACHE_FILE   = 'ps_cache.csv'  # pre-computed PS scores saved in model_folder
 PS_BAKED_CACHE  = os.path.join(SCRIPT_DIR, 'ps_cache_baked.csv')  # baked into Docker image
@@ -220,7 +220,7 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
                 direction='maximize',
                 sampler=optuna.samplers.TPESampler(seed=42),
             )
-            study.optimize(_lgbm_objective, n_trials=30,
+            study.optimize(_lgbm_objective, n_trials=80,
                            show_progress_bar=verbose)
             _best_lgbm_params = {k: v for k, v in study.best_params.items()
                                   if k != 'fs_pct'}
@@ -330,7 +330,7 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
         cv=5,
         stack_method='predict_proba',
         n_jobs=-1,
-        passthrough=False,
+        passthrough=True,
     )
 
     # ── 5-fold stratified CV to report honest AUROC ───────────────────────────
@@ -345,7 +345,7 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
             estimators=[(n, clone(m)) for n, m in estimators],
             final_estimator=clone(final_estimator),
             cv=5, stack_method='predict_proba',
-            passthrough=False, n_jobs=-1,
+            passthrough=True, n_jobs=-1,
         )
         fold_stack.fit(X_sel[tr_idx], y_arr[tr_idx])
         prob = fold_stack.predict_proba(X_sel[val_idx])[:, 1]
@@ -461,13 +461,14 @@ def extract_all_features(record, data_folder, csv_path=DEFAULT_CSV, cache_dir=No
     stages = np.asarray(algo_data.get('stage_caisr', []), dtype=float)
 
     # ── Feature groups ──────────────────────────────────────────────────────
-    f_demo   = feat_demographics(patient_data)          # [A]  10
+    f_demo   = feat_demographics(patient_data)          # [A]  13
     f_macro  = feat_sleep_macro(stages)                 # [B]  12
     f_eeg    = feat_eeg_bandpower(phys, fs, stages)     # [C]  90
     f_resp   = feat_resp_spo2(algo_data, phys)          # [D]   8
-    f_hrv    = feat_ecg_hrv(phys, fs)                  # [E]   6
+    f_hrv    = feat_ecg_hrv(phys, fs)                  # [E]   9  (v22: +LF/HF)
     f_prob   = feat_caisr_probs(algo_data)              # [F]   5
-    f_spin   = feat_custom_spindles(phys, fs, stages)          # [G]  18  NOVEL
+    f_spin   = feat_custom_spindles(phys, fs, stages)   # [G]  18  NOVEL
+    f_sw     = feat_custom_sw(phys, fs, stages)         # [O]  15  v22 NEW
     f_coup   = feat_so_spindle_coupling(phys, fs, stages)     # [H]   3  NOVEL
     f_cplx   = feat_eeg_complexity(phys, fs, stages)          # [I]  12  NOVEL
     f_frag   = feat_sleep_fragmentation(stages)                # [J]   5  NOVEL
@@ -478,14 +479,14 @@ def extract_all_features(record, data_folder, csv_path=DEFAULT_CSV, cache_dir=No
     f_coh    = feat_eeg_coherence(phys, fs, stages)            # [P]  75  NOVEL
     f_remrat = feat_rem_spectral_ratios(phys, fs, stages)      # [Q]   9  NOVEL
     f_sfar   = feat_rem_sfar(phys, fs, stages)                 # [R]   3  NOVEL
-    # f_ps disabled (PS features showed no AUROC gain in ablation)
+    f_ps     = feat_ps_scalars(patient_data)            # [S]   4  v22 (scalars only)
     f_halves = feat_half_night_spectral(phys, fs, stages)      # [T]  12  NOVEL
 
     features = np.concatenate([
         f_demo, f_macro, f_eeg, f_resp, f_hrv, f_prob,
-        f_spin, f_coup, f_cplx, f_frag, f_sef,
+        f_spin, f_sw, f_coup, f_cplx, f_frag, f_sef,
         f_wkurt, f_bkurt, f_n3rat,
-        f_coh, f_remrat, f_sfar, f_halves,
+        f_coh, f_remrat, f_sfar, f_ps, f_halves,
     ]).astype(np.float32)
 
     if cache_dir:
@@ -716,7 +717,12 @@ def feat_resp_spo2(algo_data, phys):
 # ─── [E] ECG HRV ──────────────────────────────────────────────────────────────
 
 def feat_ecg_hrv(phys, fs_dict):
-    """6 time-domain HRV features: mean_RR, SDNN, RMSSD, HR, pNN50, NN_range."""
+    """9 HRV features: 6 time-domain + 3 frequency-domain (LF, HF, LF/HF).
+
+    Time-domain: mean_RR, SDNN, RMSSD, HR, pNN50, NN_range
+    Freq-domain: log_LF (0.04-0.15 Hz), log_HF (0.15-0.4 Hz), LF/HF ratio
+    Frequency domain computed on uniformly resampled RR series at 4 Hz.
+    """
     ecg, ekg_fs = None, 200.0
     for ch in ('ekg', 'ecg'):
         if ch in phys:
@@ -724,7 +730,7 @@ def feat_ecg_hrv(phys, fs_dict):
             ekg_fs = fs_dict.get(ch, 200.0)
             break
     if ecg is None or len(ecg) < ekg_fs * 60:
-        return np.zeros(6)
+        return np.zeros(9)
     try:
         nyq  = ekg_fs / 2.0
         b, a = sp_signal.butter(2, [max(5./nyq, 1e-3), min(40./nyq, 0.99)], btype='band')
@@ -733,19 +739,43 @@ def feat_ecg_hrv(phys, fs_dict):
                                         height=np.percentile(ecg_f, 90),
                                         distance=int(0.35 * ekg_fs))
         if len(peaks) < 10:
-            return np.zeros(6)
+            return np.zeros(9)
         rr = np.diff(peaks) / ekg_fs * 1000.0
         rr = rr[(rr > 300) & (rr < 2000)]
         if len(rr) < 5:
-            return np.zeros(6)
+            return np.zeros(9)
         mean_rr = np.mean(rr)
-        return np.array([mean_rr, np.std(rr),
-                         np.sqrt(np.mean(np.diff(rr)**2)),
-                         60000. / mean_rr,
-                         np.mean(np.abs(np.diff(rr)) > 50),
-                         np.max(rr) - np.min(rr)])
+        time_feats = np.array([mean_rr, np.std(rr),
+                                np.sqrt(np.mean(np.diff(rr)**2)),
+                                60000. / mean_rr,
+                                np.mean(np.abs(np.diff(rr)) > 50),
+                                np.max(rr) - np.min(rr)])
+
+        # Frequency-domain HRV: resample RR series at 4 Hz, then Welch PSD
+        freq_feats = np.zeros(3)
+        try:
+            rr_sec    = rr / 1000.0                          # ms → s
+            rr_times  = np.cumsum(rr_sec)                    # cumulative time axis
+            rr_times  = rr_times - rr_times[0]               # start at 0
+            interp_fs = 4.0
+            t_uniform = np.arange(0, rr_times[-1], 1.0 / interp_fs)
+            if len(t_uniform) > 32:
+                rr_interp = np.interp(t_uniform, rr_times, rr_sec)
+                nperseg   = min(256, len(rr_interp) // 4)
+                if nperseg >= 8:
+                    f_rr, pxx = sp_signal.welch(rr_interp, fs=interp_fs, nperseg=nperseg)
+                    lf_m = (f_rr >= 0.04) & (f_rr < 0.15)
+                    hf_m = (f_rr >= 0.15) & (f_rr < 0.40)
+                    lf   = float(np.trapz(pxx[lf_m], f_rr[lf_m])) if lf_m.any() else 0.0
+                    hf   = float(np.trapz(pxx[hf_m], f_rr[hf_m])) if hf_m.any() else 0.0
+                    freq_feats = np.array([np.log1p(lf), np.log1p(hf),
+                                           lf / hf if hf > 0 else 0.0])
+        except Exception:
+            pass
+
+        return np.concatenate([time_feats, freq_feats])
     except Exception:
-        return np.zeros(6)
+        return np.zeros(9)
 
 
 # ─── [F] CAISR probabilities ──────────────────────────────────────────────────
@@ -990,6 +1020,107 @@ def feat_custom_spindles(phys, fs_dict, stages):
             out[b+3] = float(np.mean([(e - s) / eeg_fs for s, e in valid]))
         out[b+4] = sigma_p / alpha_p if alpha_p > 0 else 0.0
         out[b+5] = sigma_p / delta_p if delta_p > 0 else 0.0
+
+    return out
+
+
+# ─── [O] Custom Slow Wave detection ★ NOVEL v22 ──────────────────────────────
+#
+# Motivation: Slow oscillation (SO) amplitude and slope in N2/N3 are among the
+# most replicated biomarkers of cognitive decline — cortical thinning reduces
+# SO amplitude and sharpness even before clinical MCI.
+# Method: 0.5-2 Hz bandpass → negative half-wave detection by peak-finding.
+# References: Mander et al. Nature Neurosci 2015; Lucey et al. Nature Comm 2021.
+
+def feat_custom_sw(phys, fs_dict, stages):
+    """[O] 15 custom slow-wave features (5 per channel × 3 EEG channels) in N2+N3.
+
+    Per channel (C3-M2, C4-M1, F3-M2):
+      [0] sw_density    — slow waves per minute of N2+N3
+      [1] neg_amp_mean  — mean absolute negative half-wave amplitude
+      [2] pos_amp_mean  — mean positive half-wave amplitude
+      [3] ptp_mean      — mean peak-to-peak amplitude
+      [4] slope_mean    — mean negative half-wave slope (amp / half-period)
+    """
+    out = np.zeros(15)
+    if len(stages) == 0:
+        return out
+
+    for ch_idx, ch in enumerate(['c3-m2', 'c4-m1', 'f3-m2']):
+        if ch not in phys:
+            continue
+        sig        = phys[ch]
+        eeg_fs     = fs_dict.get(ch, 200.0)
+        epoch_samp = int(EPOCH_SEC * eeg_fs)
+
+        # Collect N2+N3 epochs
+        n23_bufs, n23_count = [], 0
+        for i, sv in enumerate(stages.astype(int)):
+            if sv not in (S_N2, S_N3):
+                continue
+            start = i * epoch_samp
+            end   = start + epoch_samp
+            if end > len(sig):
+                break
+            n23_bufs.append(sig[start:end])
+            n23_count += 1
+
+        if not n23_bufs or n23_count < 2:
+            continue
+
+        n23_concat = np.concatenate(n23_bufs)
+        n23_min    = n23_count * EPOCH_SEC / 60.0
+
+        try:
+            # Bandpass for slow oscillations (0.5–2 Hz)
+            so_filt = _bandpass(n23_concat, eeg_fs, 0.5, 2.0)
+
+            # Find negative peaks (invert signal so find_peaks locates troughs)
+            min_dist = int(0.5 * eeg_fs)   # minimum 0.5 s between SO troughs
+            neg_peaks, _ = sp_signal.find_peaks(-so_filt, distance=min_dist)
+
+            if len(neg_peaks) < 3:
+                continue
+
+            neg_amps, pos_amps, ptps, slopes = [], [], [], []
+
+            for k in range(len(neg_peaks) - 1):
+                n0 = neg_peaks[k]
+                n1 = neg_peaks[k + 1]
+                interval = n1 - n0
+
+                # Duration gate: 0.5–2 s
+                duration = interval / eeg_fs
+                if not (0.5 <= duration <= 2.0):
+                    continue
+
+                neg_amp = so_filt[n0]          # negative value
+                # Positive peak within the interval
+                seg     = so_filt[n0:n1]
+                pos_amp = float(np.max(seg))
+
+                ptp = pos_amp - neg_amp
+                if ptp < 0.1:                  # noise threshold (µV scale)
+                    continue
+
+                # Slope ≈ |neg_amp| / half-period
+                half_dur = duration / 2.0
+                slope    = abs(neg_amp) / half_dur if half_dur > 0 else 0.0
+
+                neg_amps.append(abs(neg_amp))
+                pos_amps.append(pos_amp)
+                ptps.append(ptp)
+                slopes.append(slope)
+
+            b = ch_idx * 5
+            if neg_amps:
+                out[b + 0] = len(neg_amps) / n23_min if n23_min > 0 else 0.0
+                out[b + 1] = float(np.mean(neg_amps))
+                out[b + 2] = float(np.mean(pos_amps))
+                out[b + 3] = float(np.mean(ptps))
+                out[b + 4] = float(np.mean(slopes))
+        except Exception:
+            pass
 
     return out
 
@@ -1379,9 +1510,9 @@ def feat_eeg_coherence(phys, fs_dict, stages):
                                               fs=sf, nperseg=nps)
                 band_coh = []
                 for _, flo, fhi in COH_BANDS:
-                    m = (f >= flo) & (f <= fhi)
-                    val = float(np.nanmean(Cxy[m])) if m.any() else 0.0
-                    band_coh.append(0.0 if np.isnan(val) else val)
+                    m    = (f >= flo) & (f <= fhi)
+                    vals = Cxy[m][~np.isnan(Cxy[m])] if m.any() else np.array([])
+                    band_coh.append(float(np.mean(vals)) if len(vals) > 0 else 0.0)
                 accum[sv].append(band_coh)
             except Exception:
                 pass
@@ -1837,6 +1968,26 @@ def feat_philosophers_stone(phys, fs_dict, patient_data):
     except Exception:
         pass  # graceful fallback — zeros indicate PS unavailable
 
+    return out
+
+
+def feat_ps_scalars(patient_data):
+    """[S] 4 Philosopher's Stone scalar features (no latent PCA).
+
+    Returns brain_health_score, total/fluid/crystallized cognition scores.
+    Uses pre-computed _PS_CACHE; graceful zero-fallback when unavailable.
+    Lighter than full PS (no PCA noise from latents).
+    """
+    out = np.zeros(4, dtype=np.float32)
+    global _PS_CACHE
+    if _PS_CACHE is None:
+        return out
+    pid    = patient_data.get(HEADERS['bids_folder'], '')
+    ses    = patient_data.get(HEADERS['session_id'],  '')
+    key    = f'{pid}_ses-{ses}'
+    cached = _PS_CACHE.get(key)
+    if cached is not None:
+        out[:4] = cached[:4]
     return out
 
 

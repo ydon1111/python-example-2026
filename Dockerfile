@@ -1,4 +1,4 @@
-FROM python:3.10.1-buster
+FROM python:3.10-slim-bullseye
 
 ## DO NOT EDIT these 3 lines.
 RUN mkdir /challenge
@@ -6,17 +6,12 @@ COPY ./ /challenge
 WORKDIR /challenge
 
 ## Install your dependencies here using apt install, etc.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends git && \
+    rm -rf /var/lib/apt/lists/*
 
 ## Include the following line if you have a requirements.txt file.
 RUN pip install -r requirements.txt
-
-## Philosopher's Stone (NEJM AI 2026) — transfer learning from 36k PSG recordings
-## Use archived repos (Debian Buster is EOL)
-RUN echo "deb http://archive.debian.org/debian buster main contrib non-free" > /etc/apt/sources.list && \
-    echo "deb http://archive.debian.org/debian-security buster/updates main" >> /etc/apt/sources.list && \
-    apt-get -o Acquire::Check-Valid-Until=false update && \
-    apt-get install -y git && \
-    rm -rf /var/lib/apt/lists/*
 RUN git clone https://github.com/bdsp-core/philosophers-stone /ps
 
 ## Patch philosopher_utils.py for PyTorch Lightning 2.x compatibility:
