@@ -170,6 +170,7 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
             tqdm.write(f'  ! {pid}: {e}')
 
     X_arr    = np.array(features, dtype=np.float32)
+    X_arr    = np.nan_to_num(X_arr, nan=0.0, posinf=0.0, neginf=0.0)
     y_arr    = np.array(labels,   dtype=int)
     site_arr = np.array(sites)
 
@@ -384,6 +385,7 @@ def run_model(model, record, data_folder, verbose):
 
     X = extract_all_features(record, data_folder, DEFAULT_CSV, cache_dir=None)
     X = X.reshape(1, -1).astype(np.float32)
+    X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
     if feat_mask is not None:
         X = X[:, feat_mask]
 
