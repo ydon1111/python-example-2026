@@ -310,9 +310,7 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
     if verbose:
         print(f'[FS] Selected {feat_mask.sum()}/{len(feat_mask)} features (threshold={threshold:.4f})')
 
-    # ── Build stacking ensemble (passthrough=True) ────────────────────────────
-    # passthrough=True: meta-learner sees base OOF predictions + original features
-    # This lets LogReg directly use strong single features as well as ensemble output
+    # ── Build stacking ensemble ───────────────────────────────────────────────
     estimators = [
         ('lgbm', _make_lgbm()),
         ('rf',   _make_rf()),
@@ -323,7 +321,18 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
     if xgb_clf is not None:
         estimators.append(('xgb', xgb_clf))
 
-    final_estimator = LogisticRegression(C=0.1, max_iter=2000, random_state=42)
+    # XGBoost meta-learner: better than LogisticRegression for stacking OOF probs
+    final_estimator = xgb.XGBClassifier(
+        n_estimators=300,
+        max_depth=3,
+        learning_rate=0.05,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        random_state=42,
+        n_jobs=-1,
+        verbosity=0,
+        eval_metric='logloss',
+    ) if HAS_XGB else LogisticRegression(C=1.0, max_iter=5000, solver='saga', random_state=42)
 
     stack = StackingClassifier(
         estimators=estimators,
@@ -331,14 +340,13 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
         cv=5,
         stack_method='predict_proba',
         n_jobs=-1,
-        passthrough=True,
+        passthrough=False,
     )
 
     # ── 5-fold stratified CV to report honest AUROC ───────────────────────────
     if verbose:
         print(f'[CV] 5-fold CV | {len(estimators)} base models ...')
     skf  = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-    # Site-stratified: combine site+diagnosis so folds are balanced per site
     strat_labels = np.array([f"{s}_{l}" for s, l in zip(site_arr, y_arr)])
     aucs = []
     for fold, (tr_idx, val_idx) in enumerate(skf.split(X_sel, strat_labels), 1):
@@ -346,7 +354,7 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
             estimators=[(n, clone(m)) for n, m in estimators],
             final_estimator=clone(final_estimator),
             cv=5, stack_method='predict_proba',
-            passthrough=True, n_jobs=-1,
+            passthrough=False, n_jobs=-1,
         )
         fold_stack.fit(X_sel[tr_idx], y_arr[tr_idx])
         prob = fold_stack.predict_proba(X_sel[val_idx])[:, 1]
