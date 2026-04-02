@@ -182,7 +182,6 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
     from sklearn.ensemble import RandomForestClassifier, ExtraTreesClassifier, StackingClassifier
     from sklearn.linear_model import LogisticRegression
     from sklearn.preprocessing import StandardScaler
-    from sklearn.preprocessing import FunctionTransformer
     from sklearn.pipeline import Pipeline
     from sklearn.base import clone
 
@@ -293,15 +292,8 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
 
     def _make_lr():
         # Linear model with scaling — adds diversity to tree-based ensemble
-        # FunctionTransformer(np.nan_to_num): sklearn 1.6 n_jobs=-1 parallel jobs
-        # can propagate inf from StandardScaler (zero-variance feature) across
-        # shared memory to other estimators; clip here to prevent it.
-        # np.nan_to_num is module-level so it's picklable by joblib.
-        _clip = FunctionTransformer(np.nan_to_num,
-                                    kw_args={'nan': 0.0, 'posinf': 0.0, 'neginf': 0.0})
         return Pipeline([
             ('scaler', StandardScaler()),
-            ('clip',   _clip),
             ('lr', LogisticRegression(C=0.05, max_iter=3000, solver='saga',
                                       random_state=42)),
         ])
