@@ -85,7 +85,7 @@ SCRIPT_DIR      = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CSV     = os.path.join(SCRIPT_DIR, 'channel_table.csv')
 CACHE_SUBDIR    = 'feature_cache'
 MODEL_FILE      = 'model.sav'
-FEATURE_VERSION = 'v22'  # bump when feature layout changes to invalidate old cache
+FEATURE_VERSION = 'v21'  # bump when feature layout changes to invalidate old cache
 PS_DIR          = '/ps'  # Philosopher's Stone repo path in Docker
 PS_CACHE_FILE   = 'ps_cache.csv'  # pre-computed PS scores saved in model_folder
 PS_BAKED_CACHE  = os.path.join(SCRIPT_DIR, 'ps_cache_baked.csv')  # baked into Docker image
@@ -182,6 +182,7 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
     from sklearn.ensemble import RandomForestClassifier, ExtraTreesClassifier, StackingClassifier
     from sklearn.linear_model import LogisticRegression
     from sklearn.preprocessing import StandardScaler
+    from sklearn.preprocessing import FunctionTransformer
     from sklearn.pipeline import Pipeline
     from sklearn.base import clone
 
@@ -292,8 +293,15 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
 
     def _make_lr():
         # Linear model with scaling — adds diversity to tree-based ensemble
+        # FunctionTransformer(np.nan_to_num): sklearn 1.6 n_jobs=-1 parallel jobs
+        # can propagate inf from StandardScaler (zero-variance feature) across
+        # shared memory to other estimators; clip here to prevent it.
+        # np.nan_to_num is module-level so it's picklable by joblib.
+        _clip = FunctionTransformer(np.nan_to_num,
+                                    kw_args={'nan': 0.0, 'posinf': 0.0, 'neginf': 0.0})
         return Pipeline([
             ('scaler', StandardScaler()),
+            ('clip',   _clip),
             ('lr', LogisticRegression(C=0.05, max_iter=3000, solver='saga',
                                       random_state=42)),
         ])
@@ -475,10 +483,9 @@ def extract_all_features(record, data_folder, csv_path=DEFAULT_CSV, cache_dir=No
     f_macro  = feat_sleep_macro(stages)                 # [B]  12
     f_eeg    = feat_eeg_bandpower(phys, fs, stages)     # [C]  90
     f_resp   = feat_resp_spo2(algo_data, phys)          # [D]   8
-    f_hrv    = feat_ecg_hrv(phys, fs)                  # [E]   9  (v22: +LF/HF)
+    f_hrv    = feat_ecg_hrv(phys, fs)                  # [E]   6
     f_prob   = feat_caisr_probs(algo_data)              # [F]   5
     f_spin   = feat_custom_spindles(phys, fs, stages)   # [G]  18  NOVEL
-    f_sw     = feat_custom_sw(phys, fs, stages)         # [O]  15  v22 NEW
     f_coup   = feat_so_spindle_coupling(phys, fs, stages)     # [H]   3  NOVEL
     f_cplx   = feat_eeg_complexity(phys, fs, stages)          # [I]  12  NOVEL
     f_frag   = feat_sleep_fragmentation(stages)                # [J]   5  NOVEL
@@ -489,14 +496,13 @@ def extract_all_features(record, data_folder, csv_path=DEFAULT_CSV, cache_dir=No
     f_coh    = feat_eeg_coherence(phys, fs, stages)            # [P]  75  NOVEL
     f_remrat = feat_rem_spectral_ratios(phys, fs, stages)      # [Q]   9  NOVEL
     f_sfar   = feat_rem_sfar(phys, fs, stages)                 # [R]   3  NOVEL
-    f_ps     = feat_ps_scalars(patient_data)            # [S]   4  v22 (scalars only)
     f_halves = feat_half_night_spectral(phys, fs, stages)      # [T]  12  NOVEL
 
     features = np.concatenate([
         f_demo, f_macro, f_eeg, f_resp, f_hrv, f_prob,
-        f_spin, f_sw, f_coup, f_cplx, f_frag, f_sef,
+        f_spin, f_coup, f_cplx, f_frag, f_sef,
         f_wkurt, f_bkurt, f_n3rat,
-        f_coh, f_remrat, f_sfar, f_ps, f_halves,
+        f_coh, f_remrat, f_sfar, f_halves,
     ]).astype(np.float32)
 
     if cache_dir:
@@ -740,7 +746,7 @@ def feat_ecg_hrv(phys, fs_dict):
             ekg_fs = fs_dict.get(ch, 200.0)
             break
     if ecg is None or len(ecg) < ekg_fs * 60:
-        return np.zeros(9)
+        return np.zeros(6)
     try:
         nyq  = ekg_fs / 2.0
         b, a = sp_signal.butter(2, [max(5./nyq, 1e-3), min(40./nyq, 0.99)], btype='band')
@@ -749,43 +755,20 @@ def feat_ecg_hrv(phys, fs_dict):
                                         height=np.percentile(ecg_f, 90),
                                         distance=int(0.35 * ekg_fs))
         if len(peaks) < 10:
-            return np.zeros(9)
+            return np.zeros(6)
         rr = np.diff(peaks) / ekg_fs * 1000.0
         rr = rr[(rr > 300) & (rr < 2000)]
         if len(rr) < 5:
-            return np.zeros(9)
+            return np.zeros(6)
         mean_rr = np.mean(rr)
         time_feats = np.array([mean_rr, np.std(rr),
                                 np.sqrt(np.mean(np.diff(rr)**2)),
                                 60000. / mean_rr,
                                 np.mean(np.abs(np.diff(rr)) > 50),
                                 np.max(rr) - np.min(rr)])
-
-        # Frequency-domain HRV: resample RR series at 4 Hz, then Welch PSD
-        freq_feats = np.zeros(3)
-        try:
-            rr_sec    = rr / 1000.0                          # ms → s
-            rr_times  = np.cumsum(rr_sec)                    # cumulative time axis
-            rr_times  = rr_times - rr_times[0]               # start at 0
-            interp_fs = 4.0
-            t_uniform = np.arange(0, rr_times[-1], 1.0 / interp_fs)
-            if len(t_uniform) > 32:
-                rr_interp = np.interp(t_uniform, rr_times, rr_sec)
-                nperseg   = min(256, len(rr_interp) // 4)
-                if nperseg >= 8:
-                    f_rr, pxx = sp_signal.welch(rr_interp, fs=interp_fs, nperseg=nperseg)
-                    lf_m = (f_rr >= 0.04) & (f_rr < 0.15)
-                    hf_m = (f_rr >= 0.15) & (f_rr < 0.40)
-                    lf   = float(np.trapz(pxx[lf_m], f_rr[lf_m])) if lf_m.any() else 0.0
-                    hf   = float(np.trapz(pxx[hf_m], f_rr[hf_m])) if hf_m.any() else 0.0
-                    freq_feats = np.array([np.log1p(lf), np.log1p(hf),
-                                           lf / hf if hf > 0 else 0.0])
-        except Exception:
-            pass
-
-        return np.concatenate([time_feats, freq_feats])
+        return time_feats
     except Exception:
-        return np.zeros(9)
+        return np.zeros(6)
 
 
 # ─── [F] CAISR probabilities ──────────────────────────────────────────────────
