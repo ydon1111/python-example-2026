@@ -177,51 +177,66 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
     from sklearn.model_selection import StratifiedKFold, cross_val_score
 
     # ── Optuna: tune LightGBM + feature-selection threshold ──────────────────
+    # IMPORTANT: feature selection is done INSIDE each fold to prevent leakage.
     _best_lgbm_params = {}
     _best_fs_pct      = 40
     if HAS_LGBM:
         try:
             import optuna
+            from sklearn.metrics import roc_auc_score as _roc
             optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+            _opt_strat = np.array([f"{s}_{l}" for s, l in zip(site_arr, y_arr)])
 
             def _lgbm_objective(trial):
                 p = dict(
-                    n_estimators      = 800,
-                    learning_rate     = 0.02,
-                    num_leaves        = trial.suggest_int('num_leaves', 10, 63),
-                    min_child_samples = trial.suggest_int('min_child_samples', 10, 80),
-                    reg_lambda        = trial.suggest_float('reg_lambda', 0.1, 20.0, log=True),
-                    reg_alpha         = trial.suggest_float('reg_alpha', 0.01, 2.0, log=True),
-                    colsample_bytree  = trial.suggest_float('colsample_bytree', 0.4, 0.9),
-                    subsample         = trial.suggest_float('subsample', 0.5, 0.9),
+                    n_estimators      = 500,
+                    learning_rate     = 0.05,
+                    num_leaves        = trial.suggest_int('num_leaves', 10, 50),
+                    min_child_samples = trial.suggest_int('min_child_samples', 20, 100),
+                    reg_lambda        = trial.suggest_float('reg_lambda', 1.0, 30.0, log=True),
+                    reg_alpha         = trial.suggest_float('reg_alpha', 0.1, 5.0, log=True),
+                    colsample_bytree  = trial.suggest_float('colsample_bytree', 0.4, 0.8),
+                    subsample         = trial.suggest_float('subsample', 0.5, 0.85),
                     subsample_freq    = 1,
                     random_state      = 42, n_jobs=1, verbose=-1,
                 )
-                fs_pct = trial.suggest_int('fs_pct', 25, 55)
-                clf_fs = lgb.LGBMClassifier(**p)
-                clf_fs.fit(X_arr, y_arr)
-                imp = clf_fs.feature_importances_
-                mask = imp >= np.percentile(imp, fs_pct)
-                Xs = X_arr[:, mask]
-                clf = lgb.LGBMClassifier(**p)
+                fs_pct = trial.suggest_int('fs_pct', 30, 65)
                 skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-                return cross_val_score(clf, Xs, y_arr, cv=skf,
-                                       scoring='roc_auc', n_jobs=-1).mean()
+                fold_aucs = []
+                for tr_idx, val_idx in skf.split(X_arr, _opt_strat):
+                    X_tr, y_tr = X_arr[tr_idx], y_arr[tr_idx]
+                    X_val, y_val = X_arr[val_idx], y_arr[val_idx]
+                    # Feature selection on TRAIN fold only — no leakage
+                    fs_clf = lgb.LGBMClassifier(**p)
+                    fs_clf.fit(X_tr, y_tr)
+                    imp  = fs_clf.feature_importances_
+                    mask = imp >= np.percentile(imp, fs_pct)
+                    if mask.sum() < 10:
+                        mask = imp >= np.percentile(imp, 30)
+                    clf = lgb.LGBMClassifier(**p)
+                    clf.fit(X_tr[:, mask], y_tr)
+                    prob = clf.predict_proba(X_val[:, mask])[:, 1]
+                    try:
+                        fold_aucs.append(_roc(y_val, prob))
+                    except Exception:
+                        fold_aucs.append(0.5)
+                return float(np.mean(fold_aucs))
 
             study = optuna.create_study(
                 direction='maximize',
                 sampler=optuna.samplers.TPESampler(seed=42),
             )
-            study.optimize(_lgbm_objective, n_trials=80,
+            study.optimize(_lgbm_objective, n_trials=50,
                            show_progress_bar=verbose)
             _best_lgbm_params = {k: v for k, v in study.best_params.items()
                                   if k != 'fs_pct'}
             _best_fs_pct = study.best_params.get('fs_pct', 40)
-            _best_lgbm_params.update(dict(n_estimators=800, learning_rate=0.02,
+            _best_lgbm_params.update(dict(n_estimators=500, learning_rate=0.05,
                                           subsample_freq=1, random_state=42,
                                           n_jobs=-1, verbose=-1))
             if verbose:
-                print(f'[Optuna] Best CV AUROC={study.best_value:.4f} | '
+                print(f'[Optuna] Best nested-CV AUROC={study.best_value:.4f} | '
                       f'fs_pct={_best_fs_pct} | params={study.best_params}')
         except Exception as e:
             if verbose:
@@ -245,9 +260,21 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
             learning_rate=0.02, subsample=0.8, random_state=42,
         )
 
-    # ── Feature selection by LGBM importance ─────────────────────────────────
+    # ── XGBoost factory (fixed good params, complements LGBM) ────────────────
+    def _make_xgb():
+        if not HAS_XGB:
+            return None
+        return xgb.XGBClassifier(
+            n_estimators=800, max_depth=4, learning_rate=0.02,
+            subsample=0.8, colsample_bytree=0.7,
+            reg_alpha=0.2, reg_lambda=3.0,
+            eval_metric='logloss', random_state=42,
+            n_jobs=-1, verbosity=0,
+        )
+
+    # ── Feature selection on full data (for final model only) ────────────────
     if verbose:
-        print('[FS] Fitting LGBM for feature importance ...')
+        print('[FS] Fitting LGBM for feature importance (full data) ...')
     clf_fs = _make_lgbm()
     clf_fs.fit(X_arr, y_arr)
     importances = clf_fs.feature_importances_
@@ -257,14 +284,47 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
     if verbose:
         print(f'[FS] Selected {feat_mask.sum()}/{len(feat_mask)} features (threshold={threshold:.4f})')
 
-    # ── Train final LGBM on full data ─────────────────────────────────────────
+    # ── 5-fold CV with nested FS — honest AUROC estimate (no leakage) ────────
+    from sklearn.metrics import roc_auc_score
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    strat_labels = np.array([f"{s}_{l}" for s, l in zip(site_arr, y_arr)])
+    aucs = []
     if verbose:
-        print('[train] Fitting final model on full data ...')
-    final_model = _make_lgbm()
-    final_model.fit(X_sel, y_arr)
+        print('[CV] 5-fold nested-CV (FS inside each fold, LGBM + XGB) ...')
+    for fold, (tr_idx, val_idx) in enumerate(skf.split(X_arr, strat_labels), 1):
+        # Feature selection on training fold only
+        fs_fold = _make_lgbm()
+        fs_fold.fit(X_arr[tr_idx], y_arr[tr_idx])
+        imp_fold  = fs_fold.feature_importances_
+        fold_mask = imp_fold >= np.percentile(imp_fold, _best_fs_pct)
+        if fold_mask.sum() < 10:
+            fold_mask = imp_fold >= np.percentile(imp_fold, 30)
+        lgbm_cv = _make_lgbm()
+        lgbm_cv.fit(X_arr[tr_idx][:, fold_mask], y_arr[tr_idx])
+        prob = lgbm_cv.predict_proba(X_arr[val_idx][:, fold_mask])[:, 1]
+        xgb_cv = _make_xgb()
+        if xgb_cv is not None:
+            xgb_cv.fit(X_arr[tr_idx][:, fold_mask], y_arr[tr_idx])
+            prob = (prob + xgb_cv.predict_proba(X_arr[val_idx][:, fold_mask])[:, 1]) / 2.0
+        auc = roc_auc_score(y_arr[val_idx], prob)
+        aucs.append(auc)
+        if verbose:
+            print(f'  Fold {fold}: AUROC={auc:.4f} | n_feat={fold_mask.sum()}')
+    if verbose:
+        print(f'[CV] Nested-CV AUROC = {np.mean(aucs):.4f}  std = {np.std(aucs):.4f}')
+
+    # ── Train final models on full data ───────────────────────────────────────
+    if verbose:
+        print('[train] Fitting final LGBM + XGB on full data ...')
+    final_lgbm = _make_lgbm()
+    final_lgbm.fit(X_sel, y_arr)
+    final_xgb = _make_xgb()
+    if final_xgb is not None:
+        final_xgb.fit(X_sel, y_arr)
 
     joblib.dump({
-        'stack':           final_model,
+        'stack':           final_lgbm,
+        'xgb_model':       final_xgb,
         'feat_mask':       feat_mask,
         'feature_version': FEATURE_VERSION,
     }, os.path.join(model_folder, MODEL_FILE))
@@ -278,10 +338,9 @@ def load_model(model_folder, verbose):
 
 
 def run_model(model, record, data_folder, verbose):
-    global _PS_PCA
-    _PS_PCA   = model.get('ps_pca')   # restore PCA transform for inference
-    stack     = model['stack']
-    feat_mask = model.get('feat_mask')
+    lgbm_model = model['stack']
+    xgb_model  = model.get('xgb_model')
+    feat_mask  = model.get('feat_mask')
 
     X = extract_all_features(record, data_folder, DEFAULT_CSV, cache_dir=None)
     X = X.reshape(1, -1).astype(np.float32)
@@ -289,7 +348,10 @@ def run_model(model, record, data_folder, verbose):
     if feat_mask is not None:
         X = X[:, feat_mask]
 
-    prob   = float(stack.predict_proba(X)[0][1])
+    prob = float(lgbm_model.predict_proba(X)[0][1])
+    if xgb_model is not None:
+        prob = (prob + float(xgb_model.predict_proba(X)[0][1])) / 2.0
+
     binary = prob >= 0.5
     return binary, prob
 
