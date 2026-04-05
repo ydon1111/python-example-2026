@@ -171,8 +171,15 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
     y_arr    = np.array(labels,   dtype=int)
     site_arr = np.array(sites)
 
+    # [P] EEG coherence (75 features, idx 220-294): zero out before training.
+    # These features are highly sensitive to recording setup (electrode impedance,
+    # amplifier gain) and overfit to site-specific patterns rather than cognitive
+    # impairment. Zeroing forces feat_mask to exclude them without cache invalidation.
+    _COH_START, _COH_END = 220, 295
+    X_arr[:, _COH_START:_COH_END] = 0.0
+
     if verbose:
-        print(f'[train] X={X_arr.shape} | pos={y_arr.sum()} neg={(y_arr==0).sum()}')
+        print(f'[train] X={X_arr.shape} | pos={y_arr.sum()} neg={(y_arr==0).sum()} | coherence zeroed')
 
     from sklearn.model_selection import StratifiedKFold, cross_val_score
 
