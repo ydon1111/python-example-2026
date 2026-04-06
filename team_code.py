@@ -171,15 +171,32 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
     y_arr    = np.array(labels,   dtype=int)
     site_arr = np.array(sites)
 
-    # [P] EEG coherence (75 features, idx 220-294): zero out before training.
-    # These features are highly sensitive to recording setup (electrode impedance,
-    # amplifier gain) and overfit to site-specific patterns rather than cognitive
-    # impairment. Zeroing forces feat_mask to exclude them without cache invalidation.
-    _COH_START, _COH_END = 220, 295
-    X_arr[:, _COH_START:_COH_END] = 0.0
+    # [P] EEG coherence (idx 220-294): zero out — site-specific hardware noise.
+    X_arr[:, 220:295] = 0.0
+
+    # [A] Site one-hot (idx 10-12): zero out — prevents model from learning
+    # site→label shortcuts that won't generalise to unseen validation sites.
+    X_arr[:, 10:13] = 0.0
+
+    # Site-normalise EEG amplitude features: [G] spindles (134-151),
+    # [I] EEG complexity/Hjorth (155-166).  These are absolute (not relative)
+    # and reflect recording hardware gain.  Z-norm per site removes that bias.
+    _SNORM_IDX = np.array(list(range(134, 152)) + list(range(155, 167)), dtype=int)
+    _site_norm = {}
+    for _s in np.unique(site_arr):
+        _m = (site_arr == _s)
+        _mu = X_arr[_m][:, _SNORM_IDX].mean(axis=0)
+        _sd = np.maximum(X_arr[_m][:, _SNORM_IDX].std(axis=0), 1e-6)
+        _site_norm[_s] = (_mu, _sd)
+        X_arr[np.ix_(_m, _SNORM_IDX)] = (X_arr[np.ix_(_m, _SNORM_IDX)] - _mu) / _sd
+    _site_norm['__global__'] = (
+        X_arr[:, _SNORM_IDX].mean(axis=0),
+        np.maximum(X_arr[:, _SNORM_IDX].std(axis=0), 1e-6),
+    )
 
     if verbose:
-        print(f'[train] X={X_arr.shape} | pos={y_arr.sum()} neg={(y_arr==0).sum()} | coherence zeroed')
+        print(f'[train] X={X_arr.shape} | pos={y_arr.sum()} neg={(y_arr==0).sum()} '
+              f'| coherence+site zeroed | G/I site-normed')
 
     from sklearn.model_selection import StratifiedKFold, cross_val_score
 
@@ -194,6 +211,16 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
             optuna.logging.set_verbosity(optuna.logging.WARNING)
 
             _opt_strat = np.array([f"{s}_{l}" for s, l in zip(site_arr, y_arr)])
+
+            # LOSO splits: hold out each minority site as a full test set.
+            # Tests true cross-site generalisation — mirrors unseen validation sites.
+            _unique_sites = np.unique(site_arr)
+            _loso_splits = []
+            for _hold in _unique_sites:
+                _tr = np.where(site_arr != _hold)[0]
+                _te = np.where(site_arr == _hold)[0]
+                if len(_tr) >= 100 and len(_te) >= 20:
+                    _loso_splits.append((_tr, _te))
 
             def _lgbm_objective(trial):
                 p = dict(
@@ -211,10 +238,10 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
                 fs_pct = trial.suggest_int('fs_pct', 30, 65)
                 skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
                 fold_aucs = []
+                # Standard stratified folds
                 for tr_idx, val_idx in skf.split(X_arr, _opt_strat):
                     X_tr, y_tr = X_arr[tr_idx], y_arr[tr_idx]
                     X_val, y_val = X_arr[val_idx], y_arr[val_idx]
-                    # Feature selection on TRAIN fold only — no leakage
                     fs_clf = lgb.LGBMClassifier(**p)
                     fs_clf.fit(X_tr, y_tr)
                     imp  = fs_clf.feature_importances_
@@ -228,6 +255,24 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
                         fold_aucs.append(_roc(y_val, prob))
                     except Exception:
                         fold_aucs.append(0.5)
+                # LOSO folds (weighted ×2 each — directly tests cross-site generalisation)
+                for tr_idx, val_idx in _loso_splits:
+                    X_tr, y_tr = X_arr[tr_idx], y_arr[tr_idx]
+                    X_val, y_val = X_arr[val_idx], y_arr[val_idx]
+                    fs_clf = lgb.LGBMClassifier(**p)
+                    fs_clf.fit(X_tr, y_tr)
+                    imp  = fs_clf.feature_importances_
+                    mask = imp >= np.percentile(imp, fs_pct)
+                    if mask.sum() < 10:
+                        mask = imp >= np.percentile(imp, 30)
+                    clf = lgb.LGBMClassifier(**p)
+                    clf.fit(X_tr[:, mask], y_tr)
+                    prob = clf.predict_proba(X_val[:, mask])[:, 1]
+                    try:
+                        loso_auc = _roc(y_val, prob)
+                        fold_aucs.extend([loso_auc, loso_auc])  # weight ×2
+                    except Exception:
+                        fold_aucs.extend([0.5, 0.5])
                 return float(np.mean(fold_aucs))
 
             study = optuna.create_study(
@@ -291,34 +336,49 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
     if verbose:
         print(f'[FS] Selected {feat_mask.sum()}/{len(feat_mask)} features (threshold={threshold:.4f})')
 
-    # ── 5-fold CV with nested FS — honest AUROC estimate (no leakage) ────────
+    # ── Nested CV + LOSO — honest AUROC + cross-site generalisation ─────────
     from sklearn.metrics import roc_auc_score
     skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
     strat_labels = np.array([f"{s}_{l}" for s, l in zip(site_arr, y_arr)])
-    aucs = []
+    aucs, loso_aucs = [], []
     if verbose:
-        print('[CV] 5-fold nested-CV (FS inside each fold, LGBM + XGB) ...')
+        print('[CV] 5-fold nested-CV + LOSO (LGBM + XGB) ...')
+
+    def _run_fold(tr_idx, val_idx):
+        fs_f = _make_lgbm()
+        fs_f.fit(X_arr[tr_idx], y_arr[tr_idx])
+        imp_f = fs_f.feature_importances_
+        fmask = imp_f >= np.percentile(imp_f, _best_fs_pct)
+        if fmask.sum() < 10:
+            fmask = imp_f >= np.percentile(imp_f, 30)
+        lg = _make_lgbm(); lg.fit(X_arr[tr_idx][:, fmask], y_arr[tr_idx])
+        pr = lg.predict_proba(X_arr[val_idx][:, fmask])[:, 1]
+        xg = _make_xgb()
+        if xg is not None:
+            xg.fit(X_arr[tr_idx][:, fmask], y_arr[tr_idx])
+            pr = (pr + xg.predict_proba(X_arr[val_idx][:, fmask])[:, 1]) / 2.0
+        return roc_auc_score(y_arr[val_idx], pr), fmask.sum()
+
     for fold, (tr_idx, val_idx) in enumerate(skf.split(X_arr, strat_labels), 1):
-        # Feature selection on training fold only
-        fs_fold = _make_lgbm()
-        fs_fold.fit(X_arr[tr_idx], y_arr[tr_idx])
-        imp_fold  = fs_fold.feature_importances_
-        fold_mask = imp_fold >= np.percentile(imp_fold, _best_fs_pct)
-        if fold_mask.sum() < 10:
-            fold_mask = imp_fold >= np.percentile(imp_fold, 30)
-        lgbm_cv = _make_lgbm()
-        lgbm_cv.fit(X_arr[tr_idx][:, fold_mask], y_arr[tr_idx])
-        prob = lgbm_cv.predict_proba(X_arr[val_idx][:, fold_mask])[:, 1]
-        xgb_cv = _make_xgb()
-        if xgb_cv is not None:
-            xgb_cv.fit(X_arr[tr_idx][:, fold_mask], y_arr[tr_idx])
-            prob = (prob + xgb_cv.predict_proba(X_arr[val_idx][:, fold_mask])[:, 1]) / 2.0
-        auc = roc_auc_score(y_arr[val_idx], prob)
+        auc, nf = _run_fold(tr_idx, val_idx)
         aucs.append(auc)
         if verbose:
-            print(f'  Fold {fold}: AUROC={auc:.4f} | n_feat={fold_mask.sum()}')
+            print(f'  Fold {fold}: AUROC={auc:.4f} | n_feat={nf}')
+
+    for _hold in np.unique(site_arr):
+        _tr = np.where(site_arr != _hold)[0]
+        _te = np.where(site_arr == _hold)[0]
+        if len(_tr) < 100 or len(_te) < 20:
+            continue
+        auc, nf = _run_fold(_tr, _te)
+        loso_aucs.append(auc)
+        if verbose:
+            print(f'  LOSO {_hold}: AUROC={auc:.4f} | n_feat={nf} | test_n={len(_te)}')
+
     if verbose:
         print(f'[CV] Nested-CV AUROC = {np.mean(aucs):.4f}  std = {np.std(aucs):.4f}')
+        if loso_aucs:
+            print(f'[CV] LOSO AUROC     = {np.mean(loso_aucs):.4f}  (cross-site estimate)')
 
     # ── Train final models on full data ───────────────────────────────────────
     if verbose:
@@ -334,6 +394,8 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
         'xgb_model':       final_xgb,
         'feat_mask':       feat_mask,
         'feature_version': FEATURE_VERSION,
+        'site_norm':       _site_norm,
+        'site_norm_idx':   _SNORM_IDX,
     }, os.path.join(model_folder, MODEL_FILE))
 
     if verbose:
@@ -352,6 +414,19 @@ def run_model(model, record, data_folder, verbose):
     X = extract_all_features(record, data_folder, DEFAULT_CSV, cache_dir=None)
     X = X.reshape(1, -1).astype(np.float32)
     X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # Zero out features that were zeroed during training
+    X[0, 220:295] = 0.0   # coherence
+    X[0, 10:13]   = 0.0   # site one-hot
+
+    # Apply site-level normalisation to EEG amplitude features
+    _snorm = model.get('site_norm')
+    _sidx  = model.get('site_norm_idx')
+    if _snorm is not None and _sidx is not None:
+        site_id = record.get(HEADERS['site_id'], '__global__')
+        _mu, _sd = _snorm.get(site_id, _snorm['__global__'])
+        X[0, _sidx] = (X[0, _sidx] - _mu) / _sd
+
     if feat_mask is not None:
         X = X[:, feat_mask]
 
