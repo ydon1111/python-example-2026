@@ -92,11 +92,12 @@ PS_BAKED_CACHE  = os.path.join(SCRIPT_DIR, 'ps_cache_baked.csv')  # baked into D
 PS_N_PCA        = 20    # PCA components from 1024-D latent → explains ~90% variance
 PS_FEAT_DIM     = 4 + PS_N_PCA   # total PS features (4 scalars + 20 PCA components)
 
-# ── Philosopher's Stone batch cache (populated during train_model) ──────────
-# dict: '{pid}_ses-{ses}' → np.array(1028,) = [4 scores | 1024 latents]
-# None = not yet loaded (inference path); dict = pre-computed (training path)
-_PS_CACHE = None  # type: ignore[assignment]
-_PS_PCA   = None  # sklearn PCA fitted on training latents; saved in model.sav
+# ── Philosopher's Stone ───────────────────────────────────────────────────────
+_PS_CACHE      = None   # baked scalar dict loaded lazily during inference
+_PS_MODEL_OBJ  = None   # pre-loaded torch model (loaded once in load_model)
+PS_SCALAR_COLS = ['brain_health_score', 'total_cognition_score',
+                  'fluid_cognition_score', 'crystallized_cognition_score']
+N_PS_FEATS     = len(PS_SCALAR_COLS)   # 4
 
 # stage_caisr: fs=1/30 Hz → one sample per 30-second PSG epoch
 # Encoding: 1=N3, 2=N2, 3=N1, 4=REM, 5=Wake, 9=Unavailable
@@ -142,6 +143,94 @@ N_FEATURES = (10 + 12 + N_EEG_CH*N_STAGES*N_BANDS + 8 + 6 + 5 + 8 + 3 + 12 + 5 +
 
 # ─── Required Challenge Functions ─────────────────────────────────────────────
 
+def _load_ps_baked(verbose=False):
+    """Load PS baked scalar cache → dict: patient_key → np.array(4)."""
+    import pandas as pd
+    try:
+        df = pd.read_csv(PS_BAKED_CACHE, index_col='patient_key',
+                         usecols=['patient_key'] + PS_SCALAR_COLS)
+        d = {k: np.array(row, dtype=np.float32)
+             for k, row in df[PS_SCALAR_COLS].iterrows()}
+        if verbose:
+            print(f'[PS] baked cache loaded: {len(d)} patients')
+        return d
+    except Exception as e:
+        if verbose:
+            print(f'[PS] baked cache unavailable: {e}')
+        return {}
+
+
+def _load_ps_model(verbose=False):
+    """Load Philosopher's Stone torch model once; return model or None."""
+    global _PS_MODEL_OBJ
+    if _PS_MODEL_OBJ is not None:
+        return _PS_MODEL_OBJ
+    try:
+        import sys
+        if PS_DIR not in sys.path:
+            sys.path.insert(0, PS_DIR)
+        from philosopher import run_philosopher  # noqa: F401 — just check import
+        from phi_utils.philosopher_utils import Config as PhiConfig
+        from phi_utils.philosopher_utils import load_model as ps_load_model
+        cfg = PhiConfig()
+        _PS_MODEL_OBJ = ps_load_model(cfg)
+        if verbose:
+            print('[PS] model loaded successfully')
+    except Exception as e:
+        _PS_MODEL_OBJ = None
+        if verbose:
+            print(f'[PS] model load failed: {e}')
+    return _PS_MODEL_OBJ
+
+
+def _get_ps_features(record, data_folder, ps_model=None, ps_cache=None):
+    """Return 4 PS scalar features for a patient; zeros on any failure."""
+    pid  = record[HEADERS['bids_folder']]
+    ses  = record[HEADERS['session_id']]
+    site = record.get(HEADERS['site_id'], 'S0001')
+    key  = f'{pid}_ses-{ses}'
+
+    # 1. Try baked cache first (fast, reliable)
+    if ps_cache and key in ps_cache:
+        return ps_cache[key]
+
+    # 2. Run PS model on the patient's EDF (slow, used during inference)
+    try:
+        import sys, tempfile, pandas as pd
+        if PS_DIR not in sys.path:
+            sys.path.insert(0, PS_DIR)
+        from philosopher import run_philosopher
+
+        phys_path = os.path.join(
+            data_folder, PHYSIOLOGICAL_DATA_SUBFOLDER, site,
+            f'{pid}_ses-{ses}.edf')
+        if not os.path.exists(phys_path):
+            return np.zeros(N_PS_FEATS, dtype=np.float32)
+
+        demo_file = os.path.join(data_folder, DEMOGRAPHICS_FILE)
+        pdata = load_demographics(demo_file, pid, ses)
+        age  = float(load_age(pdata) or 0)
+        sex  = 1 if load_sex(pdata) == 'Male' else 0
+
+        manifest = pd.DataFrame({'filepath': [phys_path],
+                                  'age': [age], 'sex': [sex]})
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result_df, _ = run_philosopher(
+                manifest,
+                outdir=tmpdir,
+                model=ps_model,
+                save_summary=False, save_json=False, save_plots=False,
+                show_progress=False, verbose=False,
+            )
+        if result_df is not None and len(result_df) > 0:
+            row = result_df.iloc[0]
+            return np.array([row.get(c, 0.0) for c in PS_SCALAR_COLS],
+                            dtype=np.float32)
+    except Exception:
+        pass
+    return np.zeros(N_PS_FEATS, dtype=np.float32)
+
+
 def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
     demo_file = os.path.join(data_folder, DEMOGRAPHICS_FILE)
     records   = find_patients(demo_file)
@@ -153,7 +242,10 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
     cache_dir = os.path.join(model_folder, CACHE_SUBDIR)
     os.makedirs(cache_dir, exist_ok=True)
 
-    features, labels, sites = [], [], []
+    # Load PS baked cache once before the extraction loop
+    _ps_cache = _load_ps_baked(verbose=verbose)
+
+    features, labels, sites, ps_rows = [], [], [], []
     pbar = tqdm(records, desc='Extracting', disable=not verbose)
     for rec in pbar:
         pid = rec[HEADERS['bids_folder']]
@@ -163,6 +255,8 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
             features.append(X)
             labels.append(label)
             sites.append(rec.get(HEADERS['site_id'], 'S0001'))
+            ps_rows.append(_get_ps_features(rec, data_folder,
+                                            ps_cache=_ps_cache))
         except Exception as e:
             tqdm.write(f'  ! {pid}: {e}')
 
@@ -171,6 +265,14 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
     y_arr    = np.array(labels,   dtype=int)
     site_arr = np.array(sites)
 
+    # Append PS scalar features (4 cols) — from baked cache; zeros if missing
+    PS_arr   = np.array(ps_rows, dtype=np.float32)
+    PS_arr   = np.nan_to_num(PS_arr, nan=0.0)
+    X_arr    = np.concatenate([X_arr, PS_arr], axis=1)   # 319+4 = 323 features
+    _ps_coverage = np.any(PS_arr != 0, axis=1).mean()
+    if verbose:
+        print(f'[PS] features appended | coverage={_ps_coverage:.1%}')
+
     # [P] EEG coherence (idx 220-294): zero out — site-specific hardware noise.
     X_arr[:, 220:295] = 0.0
 
@@ -178,10 +280,17 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
     # site→label shortcuts that won't generalise to unseen validation sites.
     X_arr[:, 10:13] = 0.0
 
-    # Site-normalise EEG amplitude features: [G] spindles (134-151),
-    # [I] EEG complexity/Hjorth (155-166).  These are absolute (not relative)
-    # and reflect recording hardware gain.  Z-norm per site removes that bias.
-    _SNORM_IDX = np.array(list(range(134, 152)) + list(range(155, 167)), dtype=int)
+    # Site-normalise absolute EEG features to remove hardware/electrode bias:
+    #   [C] EEG bandpower log1p (25-114): absolute PSD varies by amplifier/impedance
+    #   [G] spindle amplitude/power (134-151): YASA absolute values
+    #   [I] EEG complexity/Hjorth activity (155-166): variance-based, amplitude-dependent
+    # Z-norm per site; unseen validation sites fall back to __global__ stats.
+    _SNORM_IDX = np.array(
+        list(range(25, 115)) +    # [C] EEG bandpower (90 feats)
+        list(range(134, 152)) +   # [G] spindle amplitude (18 feats)
+        list(range(155, 167)),    # [I] Hjorth + spectral entropy (12 feats)
+        dtype=int
+    )
     _site_norm = {}
     for _s in np.unique(site_arr):
         _m = (site_arr == _s)
@@ -196,7 +305,7 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
 
     if verbose:
         print(f'[train] X={X_arr.shape} | pos={y_arr.sum()} neg={(y_arr==0).sum()} '
-              f'| coherence+site zeroed | G/I site-normed')
+              f'| coherence+site zeroed | C/G/I site-normed')
 
     from sklearn.model_selection import StratifiedKFold, cross_val_score
 
@@ -408,7 +517,11 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
 
 
 def load_model(model_folder, verbose):
-    return joblib.load(os.path.join(model_folder, MODEL_FILE))
+    m = joblib.load(os.path.join(model_folder, MODEL_FILE))
+    # Pre-load PS model once so run_model can reuse it (saves ~30-60s per patient)
+    m['ps_model']  = _load_ps_model(verbose=verbose)
+    m['ps_cache']  = _load_ps_baked(verbose=False)   # baked training cache
+    return m
 
 
 def run_model(model, record, data_folder, verbose):
@@ -423,6 +536,12 @@ def run_model(model, record, data_folder, verbose):
     # Zero out features that were zeroed during training
     X[0, 220:295] = 0.0   # coherence
     X[0, 10:13]   = 0.0   # site one-hot
+
+    # Append PS scalar features (4 values)
+    ps_feat = _get_ps_features(record, data_folder,
+                               ps_model=model.get('ps_model'),
+                               ps_cache=model.get('ps_cache'))
+    X = np.concatenate([X, ps_feat.reshape(1, -1)], axis=1)   # (1, 323)
 
     # Apply site-level normalisation to EEG amplitude features
     _snorm = model.get('site_norm')
