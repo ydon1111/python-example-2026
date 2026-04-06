@@ -312,14 +312,19 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
             learning_rate=0.02, subsample=0.8, random_state=42,
         )
 
-    # ── XGBoost factory (fixed good params, complements LGBM) ────────────────
+    # ── XGBoost factory — regularisation aligned with Optuna-tuned LGBM ──────
     def _make_xgb():
         if not HAS_XGB:
             return None
+        # Mirror LGBM regularisation level so both models generalise similarly
+        _lp = _best_lgbm_params if _best_lgbm_params else _lgbm_defaults
         return xgb.XGBClassifier(
-            n_estimators=800, max_depth=4, learning_rate=0.02,
-            subsample=0.8, colsample_bytree=0.7,
-            reg_alpha=0.2, reg_lambda=3.0,
+            n_estimators=500, max_depth=3, learning_rate=0.05,
+            subsample=_lp.get('subsample', 0.8),
+            colsample_bytree=_lp.get('colsample_bytree', 0.7),
+            reg_alpha=float(_lp.get('reg_alpha', 2.0)),
+            reg_lambda=float(_lp.get('reg_lambda', 10.0)),
+            min_child_weight=max(1, int(_lp.get('min_child_samples', 30) // 5)),
             eval_metric='logloss', random_state=42,
             n_jobs=-1, verbosity=0,
         )
