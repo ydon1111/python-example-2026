@@ -100,6 +100,8 @@ _PS_MODEL_OBJ  = None   # pre-loaded torch model (loaded once in load_model)
 PS_SCALAR_COLS = ['brain_health_score', 'total_cognition_score',
                   'fluid_cognition_score', 'crystallized_cognition_score']
 N_PS_FEATS     = len(PS_SCALAR_COLS) + PS_N_PCA   # 4 scalars + 50 PCA = 54
+# Hand-crafted vector from extract_all_features (before CNN & PS stack).
+N_BASE_FEATURES = 319
 
 # ── 1D-CNN raw-EEG embedding (hybrid A-plan: CNN emb + tree classifier) ─────
 CNN_INPUT_LEN = int(os.environ.get('CNN_INPUT_LEN', '8192'))
@@ -108,9 +110,14 @@ CNN_EPOCHS    = int(os.environ.get('CNN_EPOCHS', '40'))
 CNN_LR        = float(os.environ.get('CNN_LR', '0.001'))
 
 # ── Robustness experiment toggles (override via env vars) ───────────────────
-# LOSO objective = (1-LOSO_MIN_WEIGHT)*mean + LOSO_MIN_WEIGHT*min
-# Default >0 so Optuna favours worst-site AUROC (closer to unseen-site validation).
-LOSO_MIN_WEIGHT = float(os.environ.get('LOSO_MIN_WEIGHT', '0.2'))
+# Optuna LOSO objective:
+#   LOSO_OBJECTIVE=blend (default): (1-w)*mean(LOSO)+w*min(LOSO), w=LOSO_MIN_WEIGHT
+#   LOSO_OBJECTIVE=min: maximize min(LOSO) only (aggressive worst-site fit)
+# Default w=0.5 so the weakest site matters as much as the average in Optuna.
+LOSO_MIN_WEIGHT = float(os.environ.get('LOSO_MIN_WEIGHT', '0.5'))
+LOSO_OBJECTIVE  = os.environ.get('LOSO_OBJECTIVE', 'blend').strip().lower()
+# Equalize total sample weight per SiteID so majority sites do not dominate trees/CNN.
+BALANCE_SITE_WEIGHT = os.environ.get('BALANCE_SITE_WEIGHT', '1') != '0'
 USE_DUAL_LGBM   = os.environ.get('USE_DUAL_LGBM', '0') == '1'
 
 
@@ -158,6 +165,36 @@ def _iter_train_cv(cv, kind, X_arr, y_arr, site_arr, strat_labels):
         yield from cv.split(X_arr, y_arr, groups=np.asarray(site_arr))
     else:
         yield from cv.split(X_arr, strat_labels)
+
+
+def _balance_sample_weight_by_site(site_arr, sample_weight, verbose=False):
+    """Scale weights so each SiteID contributes equal total mass (domain generalization).
+
+    Without this, a high-N site dominates gradients; minority-site patterns are underfit,
+    which hurts LOSO on the large site and external validation on new domains.
+    """
+    sw = np.asarray(sample_weight, dtype=np.float64)
+    sites = np.asarray(site_arr)
+    uniq = np.unique(sites)
+    n_sites = len(uniq)
+    if n_sites < 2:
+        return sw.astype(np.float32)
+    total = float(sw.sum())
+    if total <= 0:
+        return sw.astype(np.float32)
+    target = total / float(n_sites)
+    for s in uniq:
+        m = sites == s
+        ssum = float(sw[m].sum())
+        if ssum > 1e-12:
+            sw[m] *= target / ssum
+    if verbose:
+        parts = []
+        for s in uniq:
+            m = sites == s
+            parts.append(f'{s}:n={int(m.sum())} sum_w={sw[m].sum():.2f}')
+        print(f'[SW] site-balanced totals ~equal: ' + ' | '.join(parts))
+    return sw.astype(np.float32)
 
 
 def _model_basename():
@@ -533,6 +570,11 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
         print(f'[SW] CI sample weights: '
               f'mean={sample_weight[ci_mask].mean():.3f} '
               f'range=[{sample_weight[ci_mask].min():.3f}, {sample_weight[ci_mask].max():.3f}]')
+    if BALANCE_SITE_WEIGHT:
+        sample_weight = _balance_sample_weight_by_site(
+            site_arr, sample_weight, verbose=verbose)
+    elif verbose:
+        print('[SW] site balance OFF (set BALANCE_SITE_WEIGHT=1)')
 
     # ── 1D-CNN embedding from raw C3-M2 (supervised; passed to trees) ─────────
     cnn_seg_arr = np.stack(cnn_segs, axis=0).astype(np.float32)
@@ -558,9 +600,15 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
     PS_arr = np.concatenate([scalar_arr, pca_feats], axis=1)  # (N, 54)
     # Order: handcrafted (319) | CNN emb (32) | PS (54) → 405-D
     X_arr  = np.concatenate([X_arr, cnn_emb, PS_arr], axis=1)
+    _n_tot = N_BASE_FEATURES + CNN_EMB_DIM + N_PS_FEATS
+    if X_arr.shape[1] != _n_tot:
+        raise ValueError(
+            f'Feature dim mismatch: got {X_arr.shape[1]}, expected {_n_tot} '
+            f'(base={N_BASE_FEATURES} + cnn={CNN_EMB_DIM} + ps={N_PS_FEATS}). '
+            f'Delete stale model/{CACHE_SUBDIR} npz if upgrading code.')
     if verbose:
         print(f'[PS] features appended | scalars(4)+PCA50 | coverage={has_lat.mean():.1%}')
-        print(f'[CNN+PS] X shape = {X_arr.shape} (319 + {CNN_EMB_DIM} + 54)')
+        print(f'[CNN+PS] X shape = {X_arr.shape} ({N_BASE_FEATURES}+{CNN_EMB_DIM}+{N_PS_FEATS}={_n_tot})')
 
     # [P] EEG coherence (idx 220-294): zero out — site-specific hardware noise.
     X_arr[:, 220:295] = 0.0
@@ -609,6 +657,10 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
             import optuna
             from sklearn.metrics import roc_auc_score as _roc
             optuna.logging.set_verbosity(optuna.logging.WARNING)
+            if verbose:
+                print(f'[Optuna] LOSO objective={LOSO_OBJECTIVE!r} | '
+                      f'LOSO_MIN_WEIGHT={LOSO_MIN_WEIGHT} | '
+                      f'site balance={"on" if BALANCE_SITE_WEIGHT else "off"}')
 
             # LOSO splits: hold out each minority site as a full test set.
             # Tests true cross-site generalisation — mirrors unseen validation sites.
@@ -624,8 +676,9 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
                 p = dict(
                     n_estimators      = 500,
                     learning_rate     = 0.05,
-                    num_leaves        = trial.suggest_int('num_leaves', 10, 50),
-                    min_child_samples = trial.suggest_int('min_child_samples', 20, 100),
+                    # Slightly shallower trees + more min samples → less site-specific overfit
+                    num_leaves        = trial.suggest_int('num_leaves', 8, 44),
+                    min_child_samples = trial.suggest_int('min_child_samples', 25, 120),
                     reg_lambda        = trial.suggest_float('reg_lambda', 1.0, 50.0, log=True),
                     reg_alpha         = trial.suggest_float('reg_alpha', 0.1, 10.0, log=True),
                     colsample_bytree  = trial.suggest_float('colsample_bytree', 0.4, 0.8),
@@ -659,7 +712,9 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
                         loso_aucs.append(0.5)
                 mean_auc = float(np.mean(loso_aucs))
                 min_auc  = float(np.min(loso_aucs))
-                w = float(np.clip(LOSO_MIN_WEIGHT, 0.0, 0.8))
+                if LOSO_OBJECTIVE == 'min':
+                    return min_auc
+                w = float(np.clip(LOSO_MIN_WEIGHT, 0.0, 0.95))
                 return (1.0 - w) * mean_auc + w * min_auc
 
             study = optuna.create_study(
@@ -854,6 +909,9 @@ def run_model(model, record, data_folder, verbose):
                                ps_latents=model.get('ps_latents'),
                                ps_pca=model.get('ps_pca'))
     X = np.concatenate([X, cnn_row, ps_feat.reshape(1, -1)], axis=1)
+    _n_exp = N_BASE_FEATURES + CNN_EMB_DIM + N_PS_FEATS
+    if X.shape[1] != _n_exp:
+        raise ValueError(f'run_model feature dim {X.shape[1]} != {_n_exp}')
 
     # Zero out features that were zeroed during training
     X[0, 220:295] = 0.0   # coherence
@@ -923,7 +981,7 @@ def feat_half_night_spectral(phys, fs_dict, stages):
 
 
 def extract_all_features(record, data_folder, csv_path=DEFAULT_CSV, cache_dir=None):
-    """Returns float32 array of shape (N_FEATURES,) = (162,)."""
+    """Returns float32 array of shape (N_BASE_FEATURES,) = (319,)."""
     pid = record[HEADERS['bids_folder']]
     sid = record[HEADERS['site_id']]
     ses = record[HEADERS['session_id']]
@@ -932,7 +990,14 @@ def extract_all_features(record, data_folder, csv_path=DEFAULT_CSV, cache_dir=No
         cache_file = os.path.join(cache_dir,
                                   f'{pid}_ses-{ses}_{FEATURE_VERSION}.npz')
         if os.path.exists(cache_file):
-            return np.load(cache_file)['features']
+            feat = np.load(cache_file)['features']
+            if int(feat.size) != N_BASE_FEATURES:
+                try:
+                    os.remove(cache_file)
+                except OSError:
+                    pass
+            else:
+                return feat
 
     demo_file    = os.path.join(data_folder, DEMOGRAPHICS_FILE)
     patient_data = load_demographics(demo_file, pid, ses)
@@ -978,6 +1043,9 @@ def extract_all_features(record, data_folder, csv_path=DEFAULT_CSV, cache_dir=No
         f_wkurt, f_bkurt, f_n3rat,
         f_coh, f_remrat, f_sfar, f_halves,
     ]).astype(np.float32)
+    if features.size != N_BASE_FEATURES:
+        raise RuntimeError(
+            f'extract_all_features size {features.size} != N_BASE_FEATURES {N_BASE_FEATURES}')
 
     if cache_dir:
         np.savez_compressed(cache_file, features=features)
