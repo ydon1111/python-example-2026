@@ -84,8 +84,10 @@ from helper_code import (
 SCRIPT_DIR      = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CSV     = os.path.join(SCRIPT_DIR, 'channel_table.csv')
 CACHE_SUBDIR    = 'feature_cache'
-MODEL_FILE      = 'model.sav'
-FEATURE_VERSION = 'v21'  # bump when feature layout changes to invalidate old cache
+# Serialized model filename: override with env MODEL_FILENAME or CHALLENGE_MODEL_FILE.
+# Intentionally NOT using model.sav to avoid accidentally loading legacy artifacts.
+_DEFAULT_MODEL_BASENAME = 'challenge_model_v22.joblib'
+FEATURE_VERSION = 'v22'  # v22: + CNN EEG embedding (32) before PS
 PS_DIR          = '/ps'  # Philosopher's Stone repo path in Docker
 PS_CACHE_FILE   = 'ps_cache.csv'  # pre-computed PS scores saved in model_folder
 PS_BAKED_CACHE  = os.path.join(SCRIPT_DIR, 'ps_cache_baked.csv')  # baked into Docker image
@@ -98,6 +100,87 @@ _PS_MODEL_OBJ  = None   # pre-loaded torch model (loaded once in load_model)
 PS_SCALAR_COLS = ['brain_health_score', 'total_cognition_score',
                   'fluid_cognition_score', 'crystallized_cognition_score']
 N_PS_FEATS     = len(PS_SCALAR_COLS) + PS_N_PCA   # 4 scalars + 50 PCA = 54
+
+# ── 1D-CNN raw-EEG embedding (hybrid A-plan: CNN emb + tree classifier) ─────
+CNN_INPUT_LEN = int(os.environ.get('CNN_INPUT_LEN', '8192'))
+CNN_EMB_DIM   = int(os.environ.get('CNN_EMB_DIM', '32'))
+CNN_EPOCHS    = int(os.environ.get('CNN_EPOCHS', '40'))
+CNN_LR        = float(os.environ.get('CNN_LR', '0.001'))
+
+# ── Robustness experiment toggles (override via env vars) ───────────────────
+# LOSO objective = (1-LOSO_MIN_WEIGHT)*mean + LOSO_MIN_WEIGHT*min
+# Default >0 so Optuna favours worst-site AUROC (closer to unseen-site validation).
+LOSO_MIN_WEIGHT = float(os.environ.get('LOSO_MIN_WEIGHT', '0.2'))
+USE_DUAL_LGBM   = os.environ.get('USE_DUAL_LGBM', '0') == '1'
+
+
+def _make_train_cv_splitter(site_arr, y_arr, verbose=False):
+    """CV for feature-importance FS + printed 5-fold metrics.
+
+    GROUP_CV_BY_SITE=1 (default): StratifiedGroupKFold — same SiteID never appears in
+    both train and val, reducing optimistic bias vs external / cross-site validation.
+    Set GROUP_CV_BY_SITE=0 to restore old StratifiedKFold(site×label).
+    """
+    sites = np.asarray(site_arr)
+    y = np.asarray(y_arr)
+    strat_labels = np.array([f'{s}_{l}' for s, l in zip(sites, y)])
+    if os.environ.get('GROUP_CV_BY_SITE', '1') == '0':
+        from sklearn.model_selection import StratifiedKFold
+        skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+        if verbose:
+            print('[CV] FS+report: StratifiedKFold (GROUP_CV_BY_SITE=0)')
+        return skf, 'strat', strat_labels
+    n_groups = len(np.unique(sites))
+    if n_groups < 2:
+        from sklearn.model_selection import StratifiedKFold
+        skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+        if verbose:
+            print('[CV] FS+report: StratifiedKFold — single site, cannot group by site')
+        return skf, 'strat', strat_labels
+    try:
+        from sklearn.model_selection import StratifiedGroupKFold
+        n_splits = max(2, min(5, n_groups))
+        sgkf = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=42)
+        if verbose:
+            print(f'[CV] FS+report: StratifiedGroupKFold by SiteID | '
+                  f'n_splits={n_splits} | n_sites={n_groups}')
+        return sgkf, 'group', sites
+    except Exception as e:
+        if verbose:
+            print(f'[CV] StratifiedGroupKFold failed ({e}) — StratifiedKFold fallback')
+        from sklearn.model_selection import StratifiedKFold
+        skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+        return skf, 'strat', strat_labels
+
+
+def _iter_train_cv(cv, kind, X_arr, y_arr, site_arr, strat_labels):
+    if kind == 'group':
+        yield from cv.split(X_arr, y_arr, groups=np.asarray(site_arr))
+    else:
+        yield from cv.split(X_arr, strat_labels)
+
+
+def _model_basename():
+    """Basename only. Env MODEL_FILENAME or CHALLENGE_MODEL_FILE overrides."""
+    name = (os.environ.get('MODEL_FILENAME') or
+            os.environ.get('CHALLENGE_MODEL_FILE') or
+            _DEFAULT_MODEL_BASENAME).strip()
+    return name if name else _DEFAULT_MODEL_BASENAME
+
+
+def _model_path_for_save(model_folder):
+    return os.path.normpath(os.path.join(model_folder, _model_basename()))
+
+
+def _model_path_for_load(model_folder, verbose=False):
+    """Load path: only configured/default basename; no glob fallback."""
+    primary = _model_path_for_save(model_folder)
+    if os.path.isfile(primary):
+        return primary
+    raise FileNotFoundError(
+        f'Model file not found: {primary!r}. '
+        f'Train first or set MODEL_FILENAME/CHALLENGE_MODEL_FILE to the exact filename.')
+
 
 # stage_caisr: fs=1/30 Hz → one sample per 30-second PSG epoch
 # Encoding: 1=N3, 2=N2, 3=N1, 4=REM, 5=Wake, 9=Unavailable
@@ -269,6 +352,117 @@ def _get_ps_features(record, data_folder, ps_model=None, ps_cache=None,
     return np.concatenate([scalars, pca_feats])   # shape (54,)
 
 
+# ─── 1D-CNN EEG embedding (feeds tree models; trained on labels) ─────────────
+
+if HAS_TORCH:
+    class EEGMiniCNN(nn.Module):
+        """Raw single-channel EEG segment -> 32-D embedding + aux logit (supervised)."""
+
+        def __init__(self, emb_dim=CNN_EMB_DIM, input_len=CNN_INPUT_LEN):
+            super().__init__()
+            self.emb_dim = emb_dim
+            self.encoder = nn.Sequential(
+                nn.Conv1d(1, 16, kernel_size=7, stride=2, padding=3),
+                nn.ReLU(inplace=True),
+                nn.Conv1d(16, 32, kernel_size=5, stride=2, padding=2),
+                nn.ReLU(inplace=True),
+                nn.Conv1d(32, 64, kernel_size=5, stride=2, padding=2),
+                nn.ReLU(inplace=True),
+                nn.AdaptiveAvgPool1d(1),
+            )
+            self.fc_emb = nn.Linear(64, emb_dim)
+            self.fc_cls = nn.Linear(emb_dim, 1)
+
+        def encode(self, x):
+            if x.dim() == 2:
+                x = x.unsqueeze(1)
+            h = self.encoder(x).squeeze(-1)
+            return torch.relu(self.fc_emb(h))
+
+        def forward(self, x):
+            return self.fc_cls(self.encode(x)).squeeze(-1)
+
+
+def extract_eeg_cnn_segment(record, data_folder, csv_path=DEFAULT_CSV, length=CNN_INPUT_LEN):
+    """Z-scored C3-M2 clip of length `length` (center crop; zero-pad if short)."""
+    pid = record[HEADERS['bids_folder']]
+    sid = record[HEADERS['site_id']]
+    ses = record[HEADERS['session_id']]
+    phys_path = os.path.join(data_folder, PHYSIOLOGICAL_DATA_SUBFOLDER,
+                             sid, f'{pid}_ses-{ses}.edf')
+    if not os.path.exists(phys_path):
+        return np.zeros(length, dtype=np.float32)
+    phys_raw, phys_fs_raw = load_signal_data(phys_path)
+    phys, fs = _build_channel_dict(phys_raw, phys_fs_raw, csv_path)
+    ch = 'c3-m2'
+    if ch not in phys or phys[ch] is None:
+        return np.zeros(length, dtype=np.float32)
+    sig = np.asarray(phys[ch], dtype=np.float32).ravel()
+    if sig.size == 0:
+        return np.zeros(length, dtype=np.float32)
+    if sig.size < length:
+        out = np.zeros(length, dtype=np.float32)
+        out[:sig.size] = sig
+    else:
+        s0 = (sig.size - length) // 2
+        out = sig[s0:s0 + length].astype(np.float32, copy=True)
+    mu = float(np.nanmean(out))
+    sd = float(max(np.nanstd(out), 1e-6))
+    out = (out - mu) / sd
+    return np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+
+
+def _train_cnn_embeddings(segments, y_arr, sample_weight, verbose):
+    """Returns (state_dict or None, N×CNN_EMB_DIM float32 array)."""
+    n, L = segments.shape
+    z = np.zeros((n, CNN_EMB_DIM), dtype=np.float32)
+    if not HAS_TORCH:
+        if verbose:
+            print('[CNN] torch unavailable — using zero embeddings')
+        return None, z
+    try:
+        torch.set_num_threads(max(1, (os.cpu_count() or 4) // 2))
+    except Exception:
+        pass
+    device = torch.device('cpu')
+    net = EEGMiniCNN(CNN_EMB_DIM, L).to(device)
+    opt = optim.Adam(net.parameters(), lr=CNN_LR, weight_decay=1e-4)
+    xb = torch.from_numpy(segments).float().to(device)
+    yb = torch.from_numpy(y_arr.astype(np.float32)).to(device)
+    sw = torch.from_numpy(sample_weight.astype(np.float32)).to(device)
+    net.train()
+    last_loss = 0.0
+    for _ in range(CNN_EPOCHS):
+        opt.zero_grad()
+        logits = net(xb)
+        loss_vec = nn.functional.binary_cross_entropy_with_logits(
+            logits, yb, reduction='none')
+        loss = (loss_vec * sw).sum() / (sw.sum() + 1e-9)
+        loss.backward()
+        opt.step()
+        last_loss = float(loss.detach().cpu())
+    net.eval()
+    with torch.no_grad():
+        z = net.encode(xb).cpu().numpy().astype(np.float32)
+    if verbose:
+        print(f'[CNN] {CNN_EPOCHS} ep | emb={CNN_EMB_DIM} | L={L} | '
+              f'train_BCE={last_loss:.4f}')
+    return net.state_dict(), z
+
+
+def _cnn_embed_from_state(state_dict, segment_1d):
+    """(L,) numpy -> (1, CNN_EMB_DIM) float32."""
+    if not HAS_TORCH or state_dict is None:
+        return np.zeros((1, CNN_EMB_DIM), dtype=np.float32)
+    net = EEGMiniCNN(CNN_EMB_DIM, len(segment_1d))
+    net.load_state_dict(state_dict)
+    net.eval()
+    with torch.no_grad():
+        t = torch.from_numpy(segment_1d.astype(np.float32)).unsqueeze(0)
+        e = net.encode(t).cpu().numpy()
+    return e.astype(np.float32)
+
+
 def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
     demo_file = os.path.join(data_folder, DEMOGRAPHICS_FILE)
     records   = find_patients(demo_file)
@@ -284,8 +478,21 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
     _ps_cache   = _load_ps_baked(verbose=verbose)
     _ps_latents = _load_ps_latents(verbose=verbose)
 
-    features, labels, sites = [], [], []
+    # Pre-load Time_to_Event for all patients (avoid per-patient CSV reads)
+    import pandas as _pd
+    _demo_df  = _pd.read_csv(demo_file)
+    _tte_lookup = {}
+    for _, _row in _demo_df.iterrows():
+        _key = (_row.get(HEADERS['bids_folder']), _row.get(HEADERS['session_id']))
+        _tv  = _row.get(HEADERS['time_to_event'])
+        try:
+            _tte_lookup[_key] = float(_tv) if _tv is not None and str(_tv) not in ('nan', '') else -1.0
+        except (ValueError, TypeError):
+            _tte_lookup[_key] = -1.0
+
+    features, labels, sites, tte_list = [], [], [], []
     ps_scalar_rows, ps_latent_rows = [], []
+    cnn_segs = []
     pbar = tqdm(records, desc='Extracting', disable=not verbose)
     for rec in pbar:
         pid = rec[HEADERS['bids_folder']]
@@ -297,8 +504,10 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
             features.append(X)
             labels.append(label)
             sites.append(rec.get(HEADERS['site_id'], 'S0001'))
+            tte_list.append(_tte_lookup.get((pid, ses), -1.0))   # -1.0 if unknown
             ps_scalar_rows.append(_ps_cache.get(key, np.zeros(4, dtype=np.float32)))
             ps_latent_rows.append(_ps_latents.get(key, np.zeros(PS_LATENT_DIM, dtype=np.float32)))
+            cnn_segs.append(extract_eeg_cnn_segment(rec, data_folder, csv_path))
         except Exception as e:
             tqdm.write(f'  ! {pid}: {e}')
 
@@ -306,6 +515,29 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
     X_arr    = np.nan_to_num(X_arr, nan=0.0, posinf=0.0, neginf=0.0)
     y_arr    = np.array(labels,   dtype=int)
     site_arr = np.array(sites)
+
+    # ── Sample weights via Time_to_Event (before CNN; used for CNN + trees) ───
+    tte_arr       = np.array(tte_list, dtype=np.float32)
+    sample_weight = np.ones(len(y_arr), dtype=np.float32)
+    ci_mask       = (y_arr == 1)
+    valid_tte     = tte_arr[ci_mask & (tte_arr > 0)]
+    if len(valid_tte) >= 5:
+        p5, p95 = np.percentile(valid_tte, 5), np.percentile(valid_tte, 95)
+        if p95 > p5:
+            for i in np.where(ci_mask)[0]:
+                tte = float(tte_arr[i])
+                if tte > 0:
+                    norm = np.clip((tte - p5) / (p95 - p5), 0.0, 1.0)
+                    sample_weight[i] = 1.5 - 0.5 * norm
+    if verbose:
+        print(f'[SW] CI sample weights: '
+              f'mean={sample_weight[ci_mask].mean():.3f} '
+              f'range=[{sample_weight[ci_mask].min():.3f}, {sample_weight[ci_mask].max():.3f}]')
+
+    # ── 1D-CNN embedding from raw C3-M2 (supervised; passed to trees) ─────────
+    cnn_seg_arr = np.stack(cnn_segs, axis=0).astype(np.float32)
+    cnn_state, cnn_emb = _train_cnn_embeddings(
+        cnn_seg_arr, y_arr, sample_weight, verbose)
 
     # Build PS features: 4 scalars + PCA50 on 1024-D latents = 54 total
     from sklearn.decomposition import PCA as _PCA
@@ -324,9 +556,11 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
                   f'var={ps_pca.explained_variance_ratio_.sum():.1%} | '
                   f'coverage={has_lat.mean():.1%}')
     PS_arr = np.concatenate([scalar_arr, pca_feats], axis=1)  # (N, 54)
-    X_arr  = np.concatenate([X_arr, PS_arr], axis=1)          # 319+54 = 373 features
+    # Order: handcrafted (319) | CNN emb (32) | PS (54) → 405-D
+    X_arr  = np.concatenate([X_arr, cnn_emb, PS_arr], axis=1)
     if verbose:
         print(f'[PS] features appended | scalars(4)+PCA50 | coverage={has_lat.mean():.1%}')
+        print(f'[CNN+PS] X shape = {X_arr.shape} (319 + {CNN_EMB_DIM} + 54)')
 
     # [P] EEG coherence (idx 220-294): zero out — site-specific hardware noise.
     X_arr[:, 220:295] = 0.0
@@ -362,10 +596,12 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
         print(f'[train] X={X_arr.shape} | pos={y_arr.sum()} neg={(y_arr==0).sum()} '
               f'| coherence+site zeroed | C/G/I site-normed | PS-PCA50 active')
 
-    from sklearn.model_selection import StratifiedKFold, cross_val_score
+    cv_train, _cv_kind, _ = _make_train_cv_splitter(
+        site_arr, y_arr, verbose=verbose)
+    strat_labels = np.array([f'{s}_{l}' for s, l in zip(site_arr, y_arr)])
 
-    # ── Optuna: tune LightGBM + feature-selection threshold ──────────────────
-    # IMPORTANT: feature selection is done INSIDE each fold to prevent leakage.
+    # ── Optuna: tune LightGBM + fs_pct (LOSO objective uses per-LOS fold FS) ───
+    # Final feat_mask below uses K-fold mean importance (no single full-data fit).
     _best_lgbm_params = {}
     _best_fs_pct      = 40
     if HAS_LGBM:
@@ -373,8 +609,6 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
             import optuna
             from sklearn.metrics import roc_auc_score as _roc
             optuna.logging.set_verbosity(optuna.logging.WARNING)
-
-            _opt_strat = np.array([f"{s}_{l}" for s, l in zip(site_arr, y_arr)])
 
             # LOSO splits: hold out each minority site as a full test set.
             # Tests true cross-site generalisation — mirrors unseen validation sites.
@@ -400,36 +634,39 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
                     random_state      = 42, n_jobs=1, verbose=-1,
                 )
                 fs_pct = trial.suggest_int('fs_pct', 40, 75)
-                # ── LOSO-only objective ───────────────────────────────────────
-                # k-fold CV mixes training-site data → optimises for in-site fit.
-                # Validation uses a completely unseen site → LOSO is the honest
-                # estimate of cross-site AUROC.  Optimise LOSO mean directly.
+                # ── Robust LOSO objective ──────────────────────────────────────
+                # Optimise both mean and worst-site AUROC to improve robustness
+                # under site/domain shift.
                 if not _loso_splits:
                     return 0.5
                 loso_aucs = []
                 for tr_idx, val_idx in _loso_splits:
                     X_tr, y_tr = X_arr[tr_idx], y_arr[tr_idx]
                     X_val, y_val = X_arr[val_idx], y_arr[val_idx]
+                    sw_tr = sample_weight[tr_idx]
                     fs_clf = lgb.LGBMClassifier(**p)
-                    fs_clf.fit(X_tr, y_tr)
+                    fs_clf.fit(X_tr, y_tr, sample_weight=sw_tr)
                     imp  = fs_clf.feature_importances_
                     mask = imp >= np.percentile(imp, fs_pct)
                     if mask.sum() < 10:
                         mask = imp >= np.percentile(imp, 40)
                     clf = lgb.LGBMClassifier(**p)
-                    clf.fit(X_tr[:, mask], y_tr)
+                    clf.fit(X_tr[:, mask], y_tr, sample_weight=sw_tr)
                     prob = clf.predict_proba(X_val[:, mask])[:, 1]
                     try:
                         loso_aucs.append(_roc(y_val, prob))
                     except Exception:
                         loso_aucs.append(0.5)
-                return float(np.mean(loso_aucs))
+                mean_auc = float(np.mean(loso_aucs))
+                min_auc  = float(np.min(loso_aucs))
+                w = float(np.clip(LOSO_MIN_WEIGHT, 0.0, 0.8))
+                return (1.0 - w) * mean_auc + w * min_auc
 
             study = optuna.create_study(
                 direction='maximize',
                 sampler=optuna.samplers.TPESampler(seed=42),
             )
-            study.optimize(_lgbm_objective, n_trials=50,
+            study.optimize(_lgbm_objective, n_trials=80,
                            show_progress_bar=verbose)
             _best_lgbm_params = {k: v for k, v in study.best_params.items()
                                   if k != 'fs_pct'}
@@ -452,14 +689,16 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
         random_state=42, n_jobs=-1, verbose=-1,
     )
 
-    def _make_lgbm():
+    def _make_lgbm(seed=42):
         if HAS_LGBM:
             params = _best_lgbm_params if _best_lgbm_params else _lgbm_defaults
+            params = dict(params)
+            params['random_state'] = seed
             return lgb.LGBMClassifier(**params)
         from sklearn.ensemble import GradientBoostingClassifier
         return GradientBoostingClassifier(
             n_estimators=500, max_depth=4,
-            learning_rate=0.02, subsample=0.8, random_state=42,
+            learning_rate=0.02, subsample=0.8, random_state=seed,
         )
 
     # ── XGBoost factory — regularisation aligned with Optuna-tuned LGBM ──────
@@ -485,40 +724,52 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
     # with a model fit on *all* labels inflates importance for noise and hurts
     # generalisation to unseen sites (validation is a different source).
     from sklearn.metrics import roc_auc_score
-    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-    strat_labels = np.array([f"{s}_{l}" for s, l in zip(site_arr, y_arr)])
     n_dim = X_arr.shape[1]
     imp_sum = np.zeros(n_dim, dtype=np.float64)
-    for tr_idx, _ in skf.split(X_arr, strat_labels):
+    for tr_idx, _ in _iter_train_cv(
+            cv_train, _cv_kind, X_arr, y_arr, site_arr, strat_labels):
         clf_fs = _make_lgbm()
-        clf_fs.fit(X_arr[tr_idx], y_arr[tr_idx])
+        clf_fs.fit(X_arr[tr_idx], y_arr[tr_idx],
+                   sample_weight=sample_weight[tr_idx])
         imp_sum += clf_fs.feature_importances_
-    importances = (imp_sum / float(skf.n_splits)).astype(np.float64)
+    n_cv_splits = max(1, int(cv_train.get_n_splits()))
+    importances = (imp_sum / float(n_cv_splits)).astype(np.float64)
     threshold   = np.percentile(importances, _best_fs_pct)
     feat_mask   = importances >= threshold
     if feat_mask.sum() < 10:
         feat_mask = importances >= np.percentile(importances, 30)
     X_sel = X_arr[:, feat_mask]
     if verbose:
-        print(f'[FS] K-fold mean importance → {feat_mask.sum()}/{n_dim} features '
+        print(f'[FS] CV mean importance ({n_cv_splits} folds) → {feat_mask.sum()}/{n_dim} features '
               f'(pct={_best_fs_pct}, thr={threshold:.4f}) — no full-data FS')
 
     # ── CV + LOSO — same feat_mask as deployment (no per-fold FS leakage) ────
     aucs, loso_aucs = [], []
     if verbose:
-        print('[CV] 5-fold + LOSO (LGBM + XGB), fixed feat_mask from CV above ...')
+        print('[CV] site-aware fold + LOSO (LGBM + XGB), fixed feat_mask from CV above ...')
 
     def _run_fold(tr_idx, val_idx):
-        lg = _make_lgbm()
-        lg.fit(X_arr[tr_idx][:, feat_mask], y_arr[tr_idx])
-        pr = lg.predict_proba(X_arr[val_idx][:, feat_mask])[:, 1]
+        lg_a = _make_lgbm(seed=42)
+        lg_a.fit(X_arr[tr_idx][:, feat_mask], y_arr[tr_idx],
+                 sample_weight=sample_weight[tr_idx])
+        pr = lg_a.predict_proba(X_arr[val_idx][:, feat_mask])[:, 1]
+        if USE_DUAL_LGBM:
+            lg_b = _make_lgbm(seed=1337)
+            lg_b.fit(X_arr[tr_idx][:, feat_mask], y_arr[tr_idx],
+                     sample_weight=sample_weight[tr_idx])
+            pr = (pr + lg_b.predict_proba(X_arr[val_idx][:, feat_mask])[:, 1]) / 2.0
         xg = _make_xgb()
         if xg is not None:
-            xg.fit(X_arr[tr_idx][:, feat_mask], y_arr[tr_idx])
-            pr = (pr + xg.predict_proba(X_arr[val_idx][:, feat_mask])[:, 1]) / 2.0
+            xg.fit(X_arr[tr_idx][:, feat_mask], y_arr[tr_idx],
+                   sample_weight=sample_weight[tr_idx])
+            if USE_DUAL_LGBM:
+                pr = (2.0 * pr + xg.predict_proba(X_arr[val_idx][:, feat_mask])[:, 1]) / 3.0
+            else:
+                pr = (pr + xg.predict_proba(X_arr[val_idx][:, feat_mask])[:, 1]) / 2.0
         return roc_auc_score(y_arr[val_idx], pr), int(feat_mask.sum())
 
-    for fold, (tr_idx, val_idx) in enumerate(skf.split(X_arr, strat_labels), 1):
+    for fold, (tr_idx, val_idx) in enumerate(_iter_train_cv(
+            cv_train, _cv_kind, X_arr, y_arr, site_arr, strat_labels), 1):
         auc, nf = _run_fold(tr_idx, val_idx)
         aucs.append(auc)
         if verbose:
@@ -537,33 +788,46 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
     if verbose:
         print(f'[CV] 5-fold CV AUROC  = {np.mean(aucs):.4f}  std = {np.std(aucs):.4f}')
         if loso_aucs:
-            print(f'[CV] LOSO AUROC     = {np.mean(loso_aucs):.4f}  (cross-site estimate)')
+            print(f'[CV] LOSO AUROC     = {np.mean(loso_aucs):.4f}  '
+                  f'(min={np.min(loso_aucs):.4f}, cross-site estimate)')
 
     # ── Train final models on full data ───────────────────────────────────────
     if verbose:
-        print('[train] Fitting final LGBM + XGB on full data ...')
-    final_lgbm = _make_lgbm()
-    final_lgbm.fit(X_sel, y_arr)
+        if USE_DUAL_LGBM:
+            print('[train] Fitting final LGBM(seed42/1337) + XGB on full data ...')
+        else:
+            print('[train] Fitting final LGBM(seed42) + XGB on full data ...')
+    final_lgbm = _make_lgbm(seed=42)
+    final_lgbm.fit(X_sel, y_arr, sample_weight=sample_weight)
+    final_lgbm_b = None
+    if USE_DUAL_LGBM:
+        final_lgbm_b = _make_lgbm(seed=1337)
+        final_lgbm_b.fit(X_sel, y_arr, sample_weight=sample_weight)
     final_xgb = _make_xgb()
     if final_xgb is not None:
-        final_xgb.fit(X_sel, y_arr)
+        final_xgb.fit(X_sel, y_arr, sample_weight=sample_weight)
 
     joblib.dump({
         'stack':           final_lgbm,
+        'stack_b':         final_lgbm_b,
         'xgb_model':       final_xgb,
+        'cnn_state':       cnn_state,
+        'cnn_input_len':   CNN_INPUT_LEN,
         'feat_mask':       feat_mask,
         'feature_version': FEATURE_VERSION,
         'site_norm':       _site_norm,
         'site_norm_idx':   _SNORM_IDX,
         'ps_pca':          ps_pca,          # PCA fitted on PS latents (may be None)
-    }, os.path.join(model_folder, MODEL_FILE))
+    }, _model_path_for_save(model_folder))
 
     if verbose:
+        print(f'[train] Saved model → {_model_path_for_save(model_folder)}')
         print('[train] Done.')
 
 
 def load_model(model_folder, verbose):
-    m = joblib.load(os.path.join(model_folder, MODEL_FILE))
+    _path = _model_path_for_load(model_folder, verbose=verbose)
+    m = joblib.load(_path)
     # Pre-load PS model + caches once (saves ~30-60s per patient during inference)
     m['ps_model']   = _load_ps_model(verbose=verbose)
     m['ps_cache']   = _load_ps_baked(verbose=False)    # scalar baked cache
@@ -573,6 +837,7 @@ def load_model(model_folder, verbose):
 
 def run_model(model, record, data_folder, verbose):
     lgbm_model = model['stack']
+    lgbm_model_b = model.get('stack_b')
     xgb_model  = model.get('xgb_model')
     feat_mask  = model.get('feat_mask')
 
@@ -580,13 +845,15 @@ def run_model(model, record, data_folder, verbose):
     X = X.reshape(1, -1).astype(np.float32)
     X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
 
-    # Append PS features first — must match train_model order: base (319) + PS (54) → 373
+    # Order: base (319) | CNN emb (32) | PS (54) → 405 — must match train_model
+    seg = extract_eeg_cnn_segment(record, data_folder, DEFAULT_CSV)
+    cnn_row = _cnn_embed_from_state(model.get('cnn_state'), seg)
     ps_feat = _get_ps_features(record, data_folder,
                                ps_model=model.get('ps_model'),
                                ps_cache=model.get('ps_cache'),
                                ps_latents=model.get('ps_latents'),
                                ps_pca=model.get('ps_pca'))
-    X = np.concatenate([X, ps_feat.reshape(1, -1)], axis=1)   # (1, 373)
+    X = np.concatenate([X, cnn_row, ps_feat.reshape(1, -1)], axis=1)
 
     # Zero out features that were zeroed during training
     X[0, 220:295] = 0.0   # coherence
@@ -604,8 +871,14 @@ def run_model(model, record, data_folder, verbose):
         X = X[:, feat_mask]
 
     prob = float(lgbm_model.predict_proba(X)[0][1])
+    if lgbm_model_b is not None:
+        prob = (prob + float(lgbm_model_b.predict_proba(X)[0][1])) / 2.0
     if xgb_model is not None:
-        prob = (prob + float(xgb_model.predict_proba(X)[0][1])) / 2.0
+        px = float(xgb_model.predict_proba(X)[0][1])
+        if lgbm_model_b is not None:
+            prob = (2.0 * prob + px) / 3.0
+        else:
+            prob = (prob + px) / 2.0
 
     binary = prob >= 0.5
     return binary, prob
