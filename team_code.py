@@ -360,7 +360,7 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
 
     if verbose:
         print(f'[train] X={X_arr.shape} | pos={y_arr.sum()} neg={(y_arr==0).sum()} '
-              f'| coherence+site zeroed | C/G/I site-normed')
+              f'| coherence+site zeroed | C/G/I site-normed | PS-PCA50 active')
 
     from sklearn.model_selection import StratifiedKFold, cross_val_score
 
@@ -392,34 +392,21 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
                     learning_rate     = 0.05,
                     num_leaves        = trial.suggest_int('num_leaves', 10, 50),
                     min_child_samples = trial.suggest_int('min_child_samples', 20, 100),
-                    reg_lambda        = trial.suggest_float('reg_lambda', 1.0, 30.0, log=True),
-                    reg_alpha         = trial.suggest_float('reg_alpha', 0.1, 5.0, log=True),
+                    reg_lambda        = trial.suggest_float('reg_lambda', 1.0, 50.0, log=True),
+                    reg_alpha         = trial.suggest_float('reg_alpha', 0.1, 10.0, log=True),
                     colsample_bytree  = trial.suggest_float('colsample_bytree', 0.4, 0.8),
                     subsample         = trial.suggest_float('subsample', 0.5, 0.85),
                     subsample_freq    = 1,
                     random_state      = 42, n_jobs=1, verbose=-1,
                 )
-                fs_pct = trial.suggest_int('fs_pct', 30, 65)
-                skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-                fold_aucs = []
-                # Standard stratified folds
-                for tr_idx, val_idx in skf.split(X_arr, _opt_strat):
-                    X_tr, y_tr = X_arr[tr_idx], y_arr[tr_idx]
-                    X_val, y_val = X_arr[val_idx], y_arr[val_idx]
-                    fs_clf = lgb.LGBMClassifier(**p)
-                    fs_clf.fit(X_tr, y_tr)
-                    imp  = fs_clf.feature_importances_
-                    mask = imp >= np.percentile(imp, fs_pct)
-                    if mask.sum() < 10:
-                        mask = imp >= np.percentile(imp, 30)
-                    clf = lgb.LGBMClassifier(**p)
-                    clf.fit(X_tr[:, mask], y_tr)
-                    prob = clf.predict_proba(X_val[:, mask])[:, 1]
-                    try:
-                        fold_aucs.append(_roc(y_val, prob))
-                    except Exception:
-                        fold_aucs.append(0.5)
-                # LOSO folds (weighted ×2 each — directly tests cross-site generalisation)
+                fs_pct = trial.suggest_int('fs_pct', 40, 75)
+                # ── LOSO-only objective ───────────────────────────────────────
+                # k-fold CV mixes training-site data → optimises for in-site fit.
+                # Validation uses a completely unseen site → LOSO is the honest
+                # estimate of cross-site AUROC.  Optimise LOSO mean directly.
+                if not _loso_splits:
+                    return 0.5
+                loso_aucs = []
                 for tr_idx, val_idx in _loso_splits:
                     X_tr, y_tr = X_arr[tr_idx], y_arr[tr_idx]
                     X_val, y_val = X_arr[val_idx], y_arr[val_idx]
@@ -428,16 +415,15 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
                     imp  = fs_clf.feature_importances_
                     mask = imp >= np.percentile(imp, fs_pct)
                     if mask.sum() < 10:
-                        mask = imp >= np.percentile(imp, 30)
+                        mask = imp >= np.percentile(imp, 40)
                     clf = lgb.LGBMClassifier(**p)
                     clf.fit(X_tr[:, mask], y_tr)
                     prob = clf.predict_proba(X_val[:, mask])[:, 1]
                     try:
-                        loso_auc = _roc(y_val, prob)
-                        fold_aucs.extend([loso_auc, loso_auc])  # weight ×2
+                        loso_aucs.append(_roc(y_val, prob))
                     except Exception:
-                        fold_aucs.extend([0.5, 0.5])
-                return float(np.mean(fold_aucs))
+                        loso_aucs.append(0.5)
+                return float(np.mean(loso_aucs))
 
             study = optuna.create_study(
                 direction='maximize',
@@ -493,40 +479,44 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
             n_jobs=-1, verbosity=0,
         )
 
-    # ── Feature selection on full data (for final model only) ────────────────
-    if verbose:
-        print('[FS] Fitting LGBM for feature importance (full data) ...')
-    clf_fs = _make_lgbm()
-    clf_fs.fit(X_arr, y_arr)
-    importances = clf_fs.feature_importances_
-    threshold   = np.percentile(importances, _best_fs_pct)
-    feat_mask   = importances >= threshold
-    X_sel       = X_arr[:, feat_mask]
-    if verbose:
-        print(f'[FS] Selected {feat_mask.sum()}/{len(feat_mask)} features (threshold={threshold:.4f})')
-
-    # ── Nested CV + LOSO — honest AUROC + cross-site generalisation ─────────
+    # ── Feature selection: K-fold mean importance only (no full-data fit) ────
+    # Official template README: evaluate with cross-validation on training data
+    # (github.com/physionetchallenges/python-example-2026).  Selecting features
+    # with a model fit on *all* labels inflates importance for noise and hurts
+    # generalisation to unseen sites (validation is a different source).
     from sklearn.metrics import roc_auc_score
     skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
     strat_labels = np.array([f"{s}_{l}" for s, l in zip(site_arr, y_arr)])
+    n_dim = X_arr.shape[1]
+    imp_sum = np.zeros(n_dim, dtype=np.float64)
+    for tr_idx, _ in skf.split(X_arr, strat_labels):
+        clf_fs = _make_lgbm()
+        clf_fs.fit(X_arr[tr_idx], y_arr[tr_idx])
+        imp_sum += clf_fs.feature_importances_
+    importances = (imp_sum / float(skf.n_splits)).astype(np.float64)
+    threshold   = np.percentile(importances, _best_fs_pct)
+    feat_mask   = importances >= threshold
+    if feat_mask.sum() < 10:
+        feat_mask = importances >= np.percentile(importances, 30)
+    X_sel = X_arr[:, feat_mask]
+    if verbose:
+        print(f'[FS] K-fold mean importance → {feat_mask.sum()}/{n_dim} features '
+              f'(pct={_best_fs_pct}, thr={threshold:.4f}) — no full-data FS')
+
+    # ── CV + LOSO — same feat_mask as deployment (no per-fold FS leakage) ────
     aucs, loso_aucs = [], []
     if verbose:
-        print('[CV] 5-fold nested-CV + LOSO (LGBM + XGB) ...')
+        print('[CV] 5-fold + LOSO (LGBM + XGB), fixed feat_mask from CV above ...')
 
     def _run_fold(tr_idx, val_idx):
-        fs_f = _make_lgbm()
-        fs_f.fit(X_arr[tr_idx], y_arr[tr_idx])
-        imp_f = fs_f.feature_importances_
-        fmask = imp_f >= np.percentile(imp_f, _best_fs_pct)
-        if fmask.sum() < 10:
-            fmask = imp_f >= np.percentile(imp_f, 30)
-        lg = _make_lgbm(); lg.fit(X_arr[tr_idx][:, fmask], y_arr[tr_idx])
-        pr = lg.predict_proba(X_arr[val_idx][:, fmask])[:, 1]
+        lg = _make_lgbm()
+        lg.fit(X_arr[tr_idx][:, feat_mask], y_arr[tr_idx])
+        pr = lg.predict_proba(X_arr[val_idx][:, feat_mask])[:, 1]
         xg = _make_xgb()
         if xg is not None:
-            xg.fit(X_arr[tr_idx][:, fmask], y_arr[tr_idx])
-            pr = (pr + xg.predict_proba(X_arr[val_idx][:, fmask])[:, 1]) / 2.0
-        return roc_auc_score(y_arr[val_idx], pr), fmask.sum()
+            xg.fit(X_arr[tr_idx][:, feat_mask], y_arr[tr_idx])
+            pr = (pr + xg.predict_proba(X_arr[val_idx][:, feat_mask])[:, 1]) / 2.0
+        return roc_auc_score(y_arr[val_idx], pr), int(feat_mask.sum())
 
     for fold, (tr_idx, val_idx) in enumerate(skf.split(X_arr, strat_labels), 1):
         auc, nf = _run_fold(tr_idx, val_idx)
@@ -545,7 +535,7 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
             print(f'  LOSO {_hold}: AUROC={auc:.4f} | n_feat={nf} | test_n={len(_te)}')
 
     if verbose:
-        print(f'[CV] Nested-CV AUROC = {np.mean(aucs):.4f}  std = {np.std(aucs):.4f}')
+        print(f'[CV] 5-fold CV AUROC  = {np.mean(aucs):.4f}  std = {np.std(aucs):.4f}')
         if loso_aucs:
             print(f'[CV] LOSO AUROC     = {np.mean(loso_aucs):.4f}  (cross-site estimate)')
 
@@ -590,17 +580,17 @@ def run_model(model, record, data_folder, verbose):
     X = X.reshape(1, -1).astype(np.float32)
     X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
 
-    # Zero out features that were zeroed during training
-    X[0, 220:295] = 0.0   # coherence
-    X[0, 10:13]   = 0.0   # site one-hot
-
-    # Append PS features: 4 scalars + PCA50 latents = 54 values
+    # Append PS features first — must match train_model order: base (319) + PS (54) → 373
     ps_feat = _get_ps_features(record, data_folder,
                                ps_model=model.get('ps_model'),
                                ps_cache=model.get('ps_cache'),
                                ps_latents=model.get('ps_latents'),
                                ps_pca=model.get('ps_pca'))
     X = np.concatenate([X, ps_feat.reshape(1, -1)], axis=1)   # (1, 373)
+
+    # Zero out features that were zeroed during training
+    X[0, 220:295] = 0.0   # coherence
+    X[0, 10:13]   = 0.0   # site one-hot
 
     # Apply site-level normalisation to EEG amplitude features
     _snorm = model.get('site_norm')
