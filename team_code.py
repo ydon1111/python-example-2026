@@ -89,15 +89,15 @@ FEATURE_VERSION = 'v21'  # bump when feature layout changes to invalidate old ca
 PS_DIR          = '/ps'  # Philosopher's Stone repo path in Docker
 PS_CACHE_FILE   = 'ps_cache.csv'  # pre-computed PS scores saved in model_folder
 PS_BAKED_CACHE  = os.path.join(SCRIPT_DIR, 'ps_cache_baked.csv')  # baked into Docker image
-PS_N_PCA        = 20    # PCA components from 1024-D latent → explains ~90% variance
-PS_FEAT_DIM     = 4 + PS_N_PCA   # total PS features (4 scalars + 20 PCA components)
+PS_N_PCA        = 50    # PCA components from 1024-D latent → explains ~98% variance
+PS_LATENT_DIM   = 1024  # PS latent vector dimensionality
 
 # ── Philosopher's Stone ───────────────────────────────────────────────────────
 _PS_CACHE      = None   # baked scalar dict loaded lazily during inference
 _PS_MODEL_OBJ  = None   # pre-loaded torch model (loaded once in load_model)
 PS_SCALAR_COLS = ['brain_health_score', 'total_cognition_score',
                   'fluid_cognition_score', 'crystallized_cognition_score']
-N_PS_FEATS     = len(PS_SCALAR_COLS)   # 4
+N_PS_FEATS     = len(PS_SCALAR_COLS) + PS_N_PCA   # 4 scalars + 50 PCA = 54
 
 # stage_caisr: fs=1/30 Hz → one sample per 30-second PSG epoch
 # Encoding: 1=N3, 2=N2, 3=N1, 4=REM, 5=Wake, 9=Unavailable
@@ -160,6 +160,27 @@ def _load_ps_baked(verbose=False):
         return {}
 
 
+def _load_ps_latents(verbose=False):
+    """Load PS latent vectors from baked cache → dict: patient_key → np.array(1024)."""
+    import pandas as pd
+    try:
+        header = pd.read_csv(PS_BAKED_CACHE, nrows=0)
+        lat_cols = [c for c in header.columns if c.startswith('lhl_')]
+        if not lat_cols:
+            return {}
+        df = pd.read_csv(PS_BAKED_CACHE, index_col='patient_key',
+                         usecols=['patient_key'] + lat_cols)
+        d = {k: np.array(row, dtype=np.float32)
+             for k, row in df[lat_cols].iterrows()}
+        if verbose:
+            print(f'[PS] latents loaded: {len(d)} patients, {len(lat_cols)} dims')
+        return d
+    except Exception as e:
+        if verbose:
+            print(f'[PS] latents unavailable: {e}')
+        return {}
+
+
 def _load_ps_model(verbose=False):
     """Load Philosopher's Stone torch model once; return model or None."""
     global _PS_MODEL_OBJ
@@ -183,52 +204,69 @@ def _load_ps_model(verbose=False):
     return _PS_MODEL_OBJ
 
 
-def _get_ps_features(record, data_folder, ps_model=None, ps_cache=None):
-    """Return 4 PS scalar features for a patient; zeros on any failure."""
+def _get_ps_features(record, data_folder, ps_model=None, ps_cache=None,
+                     ps_latents=None, ps_pca=None):
+    """Return 4 scalars + PS_N_PCA PCA components (total N_PS_FEATS=54); zeros on failure."""
     pid  = record[HEADERS['bids_folder']]
     ses  = record[HEADERS['session_id']]
     site = record.get(HEADERS['site_id'], 'S0001')
     key  = f'{pid}_ses-{ses}'
 
-    # 1. Try baked cache first (fast, reliable)
+    scalars = np.zeros(4, dtype=np.float32)
+    latents = np.zeros(PS_LATENT_DIM, dtype=np.float32)
+
+    # 1. Try baked cache (fast)
     if ps_cache and key in ps_cache:
-        return ps_cache[key]
+        scalars = ps_cache[key]
+    if ps_latents and key in ps_latents:
+        latents = ps_latents[key]
 
-    # 2. Run PS model on the patient's EDF (slow, used during inference)
-    try:
-        import sys, tempfile, pandas as pd
-        if PS_DIR not in sys.path:
-            sys.path.insert(0, PS_DIR)
-        from philosopher import run_philosopher
+    # 2. If latents still zero, run PS model (inference path)
+    if not np.any(latents != 0):
+        try:
+            import sys, tempfile, pandas as pd
+            if PS_DIR not in sys.path:
+                sys.path.insert(0, PS_DIR)
+            from philosopher import run_philosopher
 
-        phys_path = os.path.join(
-            data_folder, PHYSIOLOGICAL_DATA_SUBFOLDER, site,
-            f'{pid}_ses-{ses}.edf')
-        if not os.path.exists(phys_path):
-            return np.zeros(N_PS_FEATS, dtype=np.float32)
+            phys_path = os.path.join(
+                data_folder, PHYSIOLOGICAL_DATA_SUBFOLDER, site,
+                f'{pid}_ses-{ses}.edf')
+            if os.path.exists(phys_path):
+                demo_file = os.path.join(data_folder, DEMOGRAPHICS_FILE)
+                pdata = load_demographics(demo_file, pid, ses)
+                age   = float(load_age(pdata) or 0)
+                sex   = 1 if load_sex(pdata) == 'Male' else 0
+                manifest = pd.DataFrame({'filepath': [phys_path],
+                                         'age': [age], 'sex': [sex]})
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    result_df, _ = run_philosopher(
+                        manifest, outdir=tmpdir, model=ps_model,
+                        save_summary=False, save_json=False,
+                        save_plots=False, show_progress=False, verbose=False,
+                    )
+                if result_df is not None and len(result_df) > 0:
+                    row = result_df.iloc[0]
+                    scalars = np.array([row.get(c, 0.0) for c in PS_SCALAR_COLS],
+                                       dtype=np.float32)
+                    lat_cols = sorted([c for c in result_df.columns
+                                       if c.startswith('lhl_')])
+                    if lat_cols:
+                        latents = np.array([row.get(c, 0.0) for c in lat_cols],
+                                           dtype=np.float32)
+        except Exception:
+            pass
 
-        demo_file = os.path.join(data_folder, DEMOGRAPHICS_FILE)
-        pdata = load_demographics(demo_file, pid, ses)
-        age  = float(load_age(pdata) or 0)
-        sex  = 1 if load_sex(pdata) == 'Male' else 0
+    # 3. Apply PCA to latents → 50 components
+    pca_feats = np.zeros(PS_N_PCA, dtype=np.float32)
+    if ps_pca is not None and np.any(latents != 0):
+        try:
+            pca_feats = ps_pca.transform(latents.reshape(1, -1))[0].astype(np.float32)
+            pca_feats = np.nan_to_num(pca_feats, nan=0.0)
+        except Exception:
+            pass
 
-        manifest = pd.DataFrame({'filepath': [phys_path],
-                                  'age': [age], 'sex': [sex]})
-        with tempfile.TemporaryDirectory() as tmpdir:
-            result_df, _ = run_philosopher(
-                manifest,
-                outdir=tmpdir,
-                model=ps_model,
-                save_summary=False, save_json=False, save_plots=False,
-                show_progress=False, verbose=False,
-            )
-        if result_df is not None and len(result_df) > 0:
-            row = result_df.iloc[0]
-            return np.array([row.get(c, 0.0) for c in PS_SCALAR_COLS],
-                            dtype=np.float32)
-    except Exception:
-        pass
-    return np.zeros(N_PS_FEATS, dtype=np.float32)
+    return np.concatenate([scalars, pca_feats])   # shape (54,)
 
 
 def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
@@ -242,21 +280,25 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
     cache_dir = os.path.join(model_folder, CACHE_SUBDIR)
     os.makedirs(cache_dir, exist_ok=True)
 
-    # Load PS baked cache once before the extraction loop
-    _ps_cache = _load_ps_baked(verbose=verbose)
+    # Load PS baked cache (scalars + latents) before extraction loop
+    _ps_cache   = _load_ps_baked(verbose=verbose)
+    _ps_latents = _load_ps_latents(verbose=verbose)
 
-    features, labels, sites, ps_rows = [], [], [], []
+    features, labels, sites = [], [], []
+    ps_scalar_rows, ps_latent_rows = [], []
     pbar = tqdm(records, desc='Extracting', disable=not verbose)
     for rec in pbar:
         pid = rec[HEADERS['bids_folder']]
+        ses = rec[HEADERS['session_id']]
+        key = f'{pid}_ses-{ses}'
         try:
             X     = extract_all_features(rec, data_folder, csv_path, cache_dir)
             label = load_diagnoses(demo_file, pid)
             features.append(X)
             labels.append(label)
             sites.append(rec.get(HEADERS['site_id'], 'S0001'))
-            ps_rows.append(_get_ps_features(rec, data_folder,
-                                            ps_cache=_ps_cache))
+            ps_scalar_rows.append(_ps_cache.get(key, np.zeros(4, dtype=np.float32)))
+            ps_latent_rows.append(_ps_latents.get(key, np.zeros(PS_LATENT_DIM, dtype=np.float32)))
         except Exception as e:
             tqdm.write(f'  ! {pid}: {e}')
 
@@ -265,13 +307,26 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
     y_arr    = np.array(labels,   dtype=int)
     site_arr = np.array(sites)
 
-    # Append PS scalar features (4 cols) — from baked cache; zeros if missing
-    PS_arr   = np.array(ps_rows, dtype=np.float32)
-    PS_arr   = np.nan_to_num(PS_arr, nan=0.0)
-    X_arr    = np.concatenate([X_arr, PS_arr], axis=1)   # 319+4 = 323 features
-    _ps_coverage = np.any(PS_arr != 0, axis=1).mean()
+    # Build PS features: 4 scalars + PCA50 on 1024-D latents = 54 total
+    from sklearn.decomposition import PCA as _PCA
+    scalar_arr = np.nan_to_num(np.array(ps_scalar_rows, dtype=np.float32), nan=0.0)
+    lat_arr    = np.nan_to_num(np.array(ps_latent_rows, dtype=np.float32), nan=0.0)
+    has_lat    = np.any(lat_arr != 0, axis=1)
+    ps_pca     = None
+    pca_feats  = np.zeros((len(lat_arr), PS_N_PCA), dtype=np.float32)
+    if has_lat.sum() > PS_N_PCA:
+        ps_pca = _PCA(n_components=PS_N_PCA, random_state=42)
+        ps_pca.fit(lat_arr[has_lat])
+        pca_feats[has_lat] = ps_pca.transform(lat_arr[has_lat]).astype(np.float32)
+        pca_feats = np.nan_to_num(pca_feats, nan=0.0)
+        if verbose:
+            print(f'[PS] PCA {PS_N_PCA} components | '
+                  f'var={ps_pca.explained_variance_ratio_.sum():.1%} | '
+                  f'coverage={has_lat.mean():.1%}')
+    PS_arr = np.concatenate([scalar_arr, pca_feats], axis=1)  # (N, 54)
+    X_arr  = np.concatenate([X_arr, PS_arr], axis=1)          # 319+54 = 373 features
     if verbose:
-        print(f'[PS] features appended | coverage={_ps_coverage:.1%}')
+        print(f'[PS] features appended | scalars(4)+PCA50 | coverage={has_lat.mean():.1%}')
 
     # [P] EEG coherence (idx 220-294): zero out — site-specific hardware noise.
     X_arr[:, 220:295] = 0.0
@@ -510,6 +565,7 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
         'feature_version': FEATURE_VERSION,
         'site_norm':       _site_norm,
         'site_norm_idx':   _SNORM_IDX,
+        'ps_pca':          ps_pca,          # PCA fitted on PS latents (may be None)
     }, os.path.join(model_folder, MODEL_FILE))
 
     if verbose:
@@ -518,9 +574,10 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
 
 def load_model(model_folder, verbose):
     m = joblib.load(os.path.join(model_folder, MODEL_FILE))
-    # Pre-load PS model once so run_model can reuse it (saves ~30-60s per patient)
-    m['ps_model']  = _load_ps_model(verbose=verbose)
-    m['ps_cache']  = _load_ps_baked(verbose=False)   # baked training cache
+    # Pre-load PS model + caches once (saves ~30-60s per patient during inference)
+    m['ps_model']   = _load_ps_model(verbose=verbose)
+    m['ps_cache']   = _load_ps_baked(verbose=False)    # scalar baked cache
+    m['ps_latents'] = _load_ps_latents(verbose=False)  # latent baked cache
     return m
 
 
@@ -537,11 +594,13 @@ def run_model(model, record, data_folder, verbose):
     X[0, 220:295] = 0.0   # coherence
     X[0, 10:13]   = 0.0   # site one-hot
 
-    # Append PS scalar features (4 values)
+    # Append PS features: 4 scalars + PCA50 latents = 54 values
     ps_feat = _get_ps_features(record, data_folder,
                                ps_model=model.get('ps_model'),
-                               ps_cache=model.get('ps_cache'))
-    X = np.concatenate([X, ps_feat.reshape(1, -1)], axis=1)   # (1, 323)
+                               ps_cache=model.get('ps_cache'),
+                               ps_latents=model.get('ps_latents'),
+                               ps_pca=model.get('ps_pca'))
+    X = np.concatenate([X, ps_feat.reshape(1, -1)], axis=1)   # (1, 373)
 
     # Apply site-level normalisation to EEG amplitude features
     _snorm = model.get('site_norm')
