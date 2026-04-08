@@ -1,12 +1,12 @@
 #!/usr/bin/env python
 # team_code.py — PhysioNet Challenge 2026
 #
-# Feature groups (total = 319):
+# Feature groups (total = 337):
 #   [A]  demographics          13   age, sex×3, race×5, BMI, site×3
 #   [B]  sleep macrostructure  12   SL, TST, SE, WASO, stage%, REMlat, trans, TIB
 #   [C]  EEG bandpower         90   3ch × 5stages × 6bands (delta–gamma) — log1p
 #   [D]  resp / SpO2            8   AHI, arousal_idx, PLMI, SpO2 stats, ODI
-#   [E]  ECG HRV                9   mean_RR, SDNN, RMSSD, HR, pNN50, NN_range,   *** v22 ***
+#   [E]  ECG HRV                9   mean_RR, SDNN, RMSSD, HR, pNN50, NN_range,   *** v23 ***
 #                                   log_LF, log_HF, LF/HF ratio (freq domain)
 #   [F]  CAISR probabilities    5   prob_w/n3/n2/n1/r
 #   [G]  Custom spindles        18  6 feats × 3ch — sigma-band envelope det.    *** NOVEL ***
@@ -37,7 +37,7 @@
 #                                   cognition scores only (no latents) — NEJM AI 2026
 #   [T]  half-night spectral   12   delta/theta/alpha/sigma power ratio 1st/2nd half
 #
-# Model: 5-model Stacking Ensemble (v22)
+# Model: 5-model Stacking Ensemble (v23)
 #   Level-0: LightGBM, XGBoost, ExtraTrees, RandomForest, LogisticRegression
 #   Level-1: LogisticRegression (passthrough=True, 5-fold OOF)
 #   Feature selection: Optuna-tuned threshold by LightGBM importance
@@ -86,8 +86,8 @@ DEFAULT_CSV     = os.path.join(SCRIPT_DIR, 'channel_table.csv')
 CACHE_SUBDIR    = 'feature_cache'
 # Serialized model filename: override with env MODEL_FILENAME or CHALLENGE_MODEL_FILE.
 # Intentionally NOT using model.sav to avoid accidentally loading legacy artifacts.
-_DEFAULT_MODEL_BASENAME = 'challenge_model_v22.joblib'
-FEATURE_VERSION = 'v22'  # v22: + CNN EEG embedding (32) before PS
+_DEFAULT_MODEL_BASENAME = 'challenge_model_v23.joblib'
+FEATURE_VERSION = 'v23'  # v23: + slow wave features [O](15) + HRV freq domain [E](+3)
 PS_DIR          = '/ps'  # Philosopher's Stone repo path in Docker
 PS_CACHE_FILE   = 'ps_cache.csv'  # pre-computed PS scores saved in model_folder
 PS_BAKED_CACHE  = os.path.join(SCRIPT_DIR, 'ps_cache_baked.csv')  # baked into Docker image
@@ -101,14 +101,21 @@ PS_SCALAR_COLS = ['brain_health_score', 'total_cognition_score',
                   'fluid_cognition_score', 'crystallized_cognition_score']
 N_PS_FEATS     = len(PS_SCALAR_COLS) + PS_N_PCA   # 4 scalars + 50 PCA = 54
 # Hand-crafted vector from extract_all_features (before CNN & PS stack).
-N_BASE_FEATURES = 319
+# v23 index map:
+#   [A]  0-12   (13)   [B] 13-24   (12)   [C] 25-114  (90)   [D] 115-122 (8)
+#   [E] 123-131  (9)   [F] 132-136  (5)   [G] 137-154 (18)   [H] 155-157 (3)
+#   [I] 158-169 (12)   [J] 170-174  (5)   [K] 175-177  (3)   [L] 178-183 (6)
+#   [M] 184-219 (36)   [N] 220-222  (3)   [O] 223-237 (15)   [P] 238-312 (75)
+#   [Q] 313-321  (9)   [R] 322-324  (3)   [T] 325-336 (12)
+N_BASE_FEATURES = 337
 # Optional ablation of base columns (indices before CNN/PS) — cross-site robustness.
 # Env ABLATE_BLOCKS: comma list among T, remrat, sfar, spin (see _ABLATE_SLICES).
 _ABLATE_SLICES = {
-    'T':      (307, 319),  # [T] half-night spectral (12)
-    'remrat': (295, 304),  # [Q] REM spectral ratios (9)
-    'sfar':   (304, 307),  # [R] REM slow/fast (3)
-    'spin':   (134, 152),  # [G] custom spindles (18) — strong; use sparingly
+    'T':      (325, 337),  # [T] half-night spectral (12)
+    'remrat': (313, 322),  # [Q] REM spectral ratios (9)
+    'sfar':   (322, 325),  # [R] REM slow/fast (3)
+    'spin':   (137, 155),  # [G] custom spindles (18) — strong; use sparingly
+    'sw':     (223, 238),  # [O] custom slow waves (15)
 }
 
 # ── 1D-CNN raw-EEG embedding (hybrid A-plan: CNN emb + tree classifier) ─────
@@ -641,8 +648,8 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
         print(f'[PS] features appended | scalars(4)+PCA50 | coverage={has_lat.mean():.1%}')
         print(f'[CNN+PS] X shape = {X_arr.shape} ({N_BASE_FEATURES}+{CNN_EMB_DIM}+{N_PS_FEATS}={_n_tot})')
 
-    # [P] EEG coherence (idx 220-294): zero out — site-specific hardware noise.
-    X_arr[:, 220:295] = 0.0
+    # [P] EEG coherence (idx 238-312 in v23): zero out — site-specific hardware noise.
+    X_arr[:, 238:313] = 0.0
 
     # [A] Site one-hot (idx 10-12): zero out — prevents model from learning
     # site→label shortcuts that won't generalise to unseen validation sites.
@@ -656,13 +663,18 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
 
     # Site-normalise absolute EEG features to remove hardware/electrode bias:
     #   [C] EEG bandpower log1p (25-114): absolute PSD varies by amplifier/impedance
-    #   [G] spindle amplitude/power (134-151): YASA absolute values
-    #   [I] EEG complexity/Hjorth activity (155-166): variance-based, amplitude-dependent
+    #   [G] spindle amplitude/power (137-154 in v23): envelope values
+    #   [I] EEG complexity/Hjorth activity (158-169 in v23): variance-based, amplitude-dependent
+    #   [O] slow wave amplitudes (v23): neg_amp, pos_amp, ptp, slope per ch (skip density at +0)
+    #       ch0: 224-227  ch1: 229-232  ch2: 234-237
     # Z-norm per site; unseen validation sites fall back to __global__ stats.
     _SNORM_IDX = np.array(
-        list(range(25, 115)) +    # [C] EEG bandpower (90 feats)
-        list(range(134, 152)) +   # [G] spindle amplitude (18 feats)
-        list(range(155, 167)),    # [I] Hjorth + spectral entropy (12 feats)
+        list(range(25, 115)) +        # [C] EEG bandpower (90 feats)
+        list(range(137, 155)) +       # [G] spindle amplitude (18 feats)
+        list(range(158, 170)) +       # [I] Hjorth + spectral entropy (12 feats)
+        [224, 225, 226, 227,          # [O] c3-m2: neg_amp, pos_amp, ptp, slope
+         229, 230, 231, 232,          # [O] c4-m1: neg_amp, pos_amp, ptp, slope
+         234, 235, 236, 237],         # [O] f3-m2: neg_amp, pos_amp, ptp, slope
         dtype=int
     )
     _site_norm = {}
@@ -679,7 +691,7 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
 
     if verbose:
         print(f'[train] X={X_arr.shape} | pos={y_arr.sum()} neg={(y_arr==0).sum()} '
-              f'| coherence+site zeroed | C/G/I site-normed | PS-PCA50 active')
+              f'| coherence+site zeroed | C/G/I/O site-normed | PS-PCA50 active')
 
     cv_train, _cv_kind, _ = _make_train_cv_splitter(
         site_arr, y_arr, verbose=verbose)
@@ -810,6 +822,20 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
             n_jobs=-1, verbosity=0,
         )
 
+    # ── ExtraTrees factory — high variance, low bias; diversifies ensemble ────
+    def _make_etc():
+        from sklearn.ensemble import ExtraTreesClassifier
+        _lp = _best_lgbm_params if _best_lgbm_params else _lgbm_defaults
+        _min_leaf = max(3, int(_lp.get('min_child_samples', 30) // 4))
+        return ExtraTreesClassifier(
+            n_estimators=500,
+            max_features='sqrt',
+            min_samples_leaf=_min_leaf,
+            class_weight='balanced',
+            random_state=42,
+            n_jobs=-1,
+        )
+
     # ── Feature selection: K-fold mean importance only (no full-data fit) ────
     # Official template README: evaluate with cross-validation on training data
     # (github.com/physionetchallenges/python-example-2026).  Selecting features
@@ -858,6 +884,12 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
                 pr = (2.0 * pr + xg.predict_proba(X_arr[val_idx][:, feat_mask])[:, 1]) / 3.0
             else:
                 pr = (pr + xg.predict_proba(X_arr[val_idx][:, feat_mask])[:, 1]) / 2.0
+        # ExtraTrees: adds ensemble diversity (sklearn, no extra deps)
+        etc = _make_etc()
+        etc.fit(X_arr[tr_idx][:, feat_mask], y_arr[tr_idx],
+                sample_weight=sample_weight[tr_idx])
+        pr_etc = etc.predict_proba(X_arr[val_idx][:, feat_mask])[:, 1]
+        pr = (3.0 * pr + pr_etc) / 4.0   # weight ETC less than boosting ensemble
         return roc_auc_score(y_arr[val_idx], pr), int(feat_mask.sum())
 
     for fold, (tr_idx, val_idx) in enumerate(_iter_train_cv(
@@ -898,6 +930,10 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
     final_xgb = _make_xgb()
     if final_xgb is not None:
         final_xgb.fit(X_sel, y_arr, sample_weight=sample_weight)
+    final_etc = _make_etc()
+    final_etc.fit(X_sel, y_arr, sample_weight=sample_weight)
+    if verbose:
+        print('[train] Fitting final LGBM + XGB + ExtraTrees done')
 
     cmode = CLASSIFIER_MODE if CLASSIFIER_MODE in ('trees', 'mlp', 'hybrid') else 'trees'
     final_mlp, mlp_scaler = None, None
@@ -928,6 +964,7 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
         'stack':            final_lgbm,
         'stack_b':          final_lgbm_b,
         'xgb_model':        final_xgb,
+        'etc_model':        final_etc,       # ExtraTrees ensemble member
         'mlp_model':        final_mlp,
         'mlp_scaler':       mlp_scaler,
         'classifier_mode':  cmode,
@@ -960,13 +997,14 @@ def run_model(model, record, data_folder, verbose):
     lgbm_model = model['stack']
     lgbm_model_b = model.get('stack_b')
     xgb_model  = model.get('xgb_model')
+    etc_model  = model.get('etc_model')
     feat_mask  = model.get('feat_mask')
 
     X = extract_all_features(record, data_folder, DEFAULT_CSV, cache_dir=None)
     X = X.reshape(1, -1).astype(np.float32)
     X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
 
-    # Order: base (319) | CNN emb (32) | PS (54) → 405 — must match train_model
+    # Order: base (337) | CNN emb (32) | PS (54) → 423 — must match train_model
     seg = extract_eeg_cnn_segment(record, data_folder, DEFAULT_CSV)
     cnn_row = _cnn_embed_from_state(model.get('cnn_state'), seg)
     ps_feat = _get_ps_features(record, data_folder,
@@ -980,7 +1018,7 @@ def run_model(model, record, data_folder, verbose):
         raise ValueError(f'run_model feature dim {X.shape[1]} != {_n_exp}')
 
     # Zero out features that were zeroed during training
-    X[0, 220:295] = 0.0   # coherence
+    X[0, 238:313] = 0.0   # coherence [P] idx 238-312 in v23
     X[0, 10:13]   = 0.0   # site one-hot
 
     for bid in (model.get('ablate_blocks') or []):
@@ -1013,6 +1051,10 @@ def run_model(model, record, data_folder, verbose):
                 p = (2.0 * p + px) / 3.0
             else:
                 p = (p + px) / 2.0
+        # ExtraTrees: adds ensemble diversity (25% weight)
+        if etc_model is not None:
+            p_etc = float(etc_model.predict_proba(X)[0][1])
+            p = (3.0 * p + p_etc) / 4.0
         return p
 
     if cmode == 'mlp' and mlp_m is not None and mlp_sc is not None:
@@ -1109,7 +1151,7 @@ def extract_all_features(record, data_folder, csv_path=DEFAULT_CSV, cache_dir=No
     f_macro  = feat_sleep_macro(stages)                 # [B]  12
     f_eeg    = feat_eeg_bandpower(phys, fs, stages)     # [C]  90
     f_resp   = feat_resp_spo2(algo_data, phys)          # [D]   8
-    f_hrv    = feat_ecg_hrv(phys, fs)                  # [E]   6
+    f_hrv    = feat_ecg_hrv(phys, fs)                  # [E]   9  (6 time + 3 freq)
     f_prob   = feat_caisr_probs(algo_data)              # [F]   5
     f_spin   = feat_custom_spindles(phys, fs, stages)   # [G]  18  NOVEL
     f_coup   = feat_so_spindle_coupling(phys, fs, stages)     # [H]   3  NOVEL
@@ -1119,6 +1161,7 @@ def extract_all_features(record, data_folder, csv_path=DEFAULT_CSV, cache_dir=No
     f_wkurt  = feat_waveform_kurtosis(phys, fs, stages)        # [L]   6  NOVEL
     f_bkurt  = feat_bandpower_kurtosis(phys, fs, stages)       # [M]  36  NOVEL
     f_n3rat  = feat_n3_ratios(phys, fs, stages)                # [N]   3  NOVEL
+    f_sw     = feat_custom_slowwaves(phys, fs, stages)         # [O]  15  NOVEL
     f_coh    = feat_eeg_coherence(phys, fs, stages)            # [P]  75  NOVEL
     f_remrat = feat_rem_spectral_ratios(phys, fs, stages)      # [Q]   9  NOVEL
     f_sfar   = feat_rem_sfar(phys, fs, stages)                 # [R]   3  NOVEL
@@ -1128,7 +1171,7 @@ def extract_all_features(record, data_folder, csv_path=DEFAULT_CSV, cache_dir=No
         f_demo, f_macro, f_eeg, f_resp, f_hrv, f_prob,
         f_spin, f_coup, f_cplx, f_frag, f_sef,
         f_wkurt, f_bkurt, f_n3rat,
-        f_coh, f_remrat, f_sfar, f_halves,
+        f_sw, f_coh, f_remrat, f_sfar, f_halves,
     ]).astype(np.float32)
     if features.size != N_BASE_FEATURES:
         raise RuntimeError(
@@ -1367,6 +1410,8 @@ def feat_ecg_hrv(phys, fs_dict):
     Time-domain: mean_RR, SDNN, RMSSD, HR, pNN50, NN_range
     Freq-domain: log_LF (0.04-0.15 Hz), log_HF (0.15-0.4 Hz), LF/HF ratio
     Frequency domain computed on uniformly resampled RR series at 4 Hz.
+    Autonomic modulation via HRV spectral indices correlates with cognitive decline.
+    Reference: Kim et al. 2019 (HRV as dementia biomarker).
     """
     ecg, ekg_fs = None, 200.0
     for ch in ('ekg', 'ecg'):
@@ -1375,7 +1420,7 @@ def feat_ecg_hrv(phys, fs_dict):
             ekg_fs = fs_dict.get(ch, 200.0)
             break
     if ecg is None or len(ecg) < ekg_fs * 60:
-        return np.zeros(6)
+        return np.zeros(9)
     try:
         nyq  = ekg_fs / 2.0
         b, a = sp_signal.butter(2, [max(5./nyq, 1e-3), min(40./nyq, 0.99)], btype='band')
@@ -1384,20 +1429,43 @@ def feat_ecg_hrv(phys, fs_dict):
                                         height=np.percentile(ecg_f, 90),
                                         distance=int(0.35 * ekg_fs))
         if len(peaks) < 10:
-            return np.zeros(6)
+            return np.zeros(9)
         rr = np.diff(peaks) / ekg_fs * 1000.0
         rr = rr[(rr > 300) & (rr < 2000)]
         if len(rr) < 5:
-            return np.zeros(6)
+            return np.zeros(9)
         mean_rr = np.mean(rr)
         time_feats = np.array([mean_rr, np.std(rr),
                                 np.sqrt(np.mean(np.diff(rr)**2)),
                                 60000. / mean_rr,
                                 np.mean(np.abs(np.diff(rr)) > 50),
                                 np.max(rr) - np.min(rr)])
-        return time_feats
+        # Frequency domain: resample RR to uniform 4 Hz grid, compute Welch PSD
+        freq_feats = np.zeros(3)
+        if len(rr) >= 30:
+            try:
+                rr_times  = np.cumsum(rr) / 1000.0   # ms → seconds
+                fs_rr     = 4.0
+                t_uniform = np.arange(rr_times[0], rr_times[-1], 1.0 / fs_rr)
+                rr_interp = np.interp(t_uniform, rr_times, rr)
+                if len(rr_interp) >= 64:
+                    nperseg_rr = min(256, len(rr_interp) // 2)
+                    f_rr, psd_rr = sp_signal.welch(
+                        rr_interp - rr_interp.mean(), fs=fs_rr, nperseg=nperseg_rr)
+                    lf_m   = (f_rr >= 0.04) & (f_rr <= 0.15)
+                    hf_m   = (f_rr >= 0.15) & (f_rr <= 0.40)
+                    lf_pow = np.trapz(psd_rr[lf_m], f_rr[lf_m]) if lf_m.any() else 0.0
+                    hf_pow = np.trapz(psd_rr[hf_m], f_rr[hf_m]) if hf_m.any() else 0.0
+                    freq_feats = np.array([
+                        np.log1p(lf_pow),           # log_LF
+                        np.log1p(hf_pow),           # log_HF
+                        lf_pow / (hf_pow + 1e-10),  # LF/HF sympathovagal balance
+                    ])
+            except Exception:
+                pass
+        return np.concatenate([time_feats, freq_feats])
     except Exception:
-        return np.zeros(6)
+        return np.zeros(9)
 
 
 # ─── [F] CAISR probabilities ──────────────────────────────────────────────────
@@ -1844,6 +1912,133 @@ def feat_n3_ratios(phys, fs_dict, stages):
     out[0] = dm / am if am > 0 else 0.0  # delta/alpha — EEG slowing marker
     out[1] = dm / tm if tm > 0 else 0.0  # delta/theta — cognitive decline marker
     out[2] = sm / dm if dm > 0 else 0.0  # sigma/delta — spindle vs slow-wave balance
+    return out
+
+
+# ─── [O] Custom slow wave detection ★ NOVEL ──────────────────────────────────
+#
+# Motivation: Slow oscillations (SOs, 0.5-2 Hz) during NREM sleep drive memory
+# consolidation via SO-spindle coupling.  In MCI/AD, SOs show reduced amplitude,
+# shallower slopes, and lower density — detectable years before symptom onset.
+# Reference: Mander et al. Nature Neuroscience 2015 (SO disruption in MCI).
+# Algorithm: 0.5-2 Hz bandpass + zero-crossing detection + amplitude thresholding.
+
+def feat_custom_slowwaves(phys, fs_dict, stages):
+    """[O] 15 custom slow wave features (5 per channel × 3 EEG channels) in N2+N3 sleep.
+
+    Per channel (C3-M2, C4-M1, F3-M2):
+      [0] density   — slow oscillations per minute of NREM (N2+N3)
+      [1] neg_amp   — mean negative peak amplitude (abs, µV equivalent)
+      [2] pos_amp   — mean positive peak amplitude
+      [3] ptp       — mean peak-to-peak amplitude (pos_amp + |neg_amp|)
+      [4] slope     — mean rising slope from negative trough to positive peak
+    """
+    out = np.zeros(15)
+    if len(stages) == 0:
+        return out
+
+    nrem_stages = {S_N2, S_N3}
+
+    for ch_idx, ch in enumerate(['c3-m2', 'c4-m1', 'f3-m2']):
+        if ch not in phys:
+            continue
+        sig        = phys[ch].astype(float)
+        eeg_fs     = fs_dict.get(ch, 200.0)
+        epoch_samp = int(EPOCH_SEC * eeg_fs)
+
+        # Collect contiguous N2+N3 signal
+        nrem_segs = []
+        nrem_min  = 0.0
+        for i, sv in enumerate(stages.astype(int)):
+            if sv not in nrem_stages:
+                continue
+            start = i * epoch_samp
+            end   = start + epoch_samp
+            if end > len(sig):
+                break
+            nrem_segs.append(sig[start:end])
+            nrem_min += EPOCH_SEC / 60.0
+
+        if len(nrem_segs) < 2 or nrem_min < 1.0:
+            continue
+
+        nrem_sig = np.concatenate(nrem_segs)
+
+        # Bandpass 0.5–2 Hz (slow oscillation band)
+        try:
+            filtered = _bandpass(nrem_sig, eeg_fs, 0.5, 2.0)
+        except Exception:
+            continue
+
+        # Zero-crossing-based SO detection
+        # neg→pos crossing marks start of a negative half-wave
+        neg2pos = np.where((filtered[:-1] < 0) & (filtered[1:] >= 0))[0]
+        pos2neg = np.where((filtered[:-1] >= 0) & (filtered[1:] < 0))[0]
+
+        if len(neg2pos) < 3 or len(pos2neg) < 2:
+            continue
+
+        # Duration gates: negative half-wave 0.5–1.5 s; positive half-wave 0.25–1.5 s
+        min_neg = int(0.5  * eeg_fs)
+        max_neg = int(1.5  * eeg_fs)
+        min_pos = int(0.25 * eeg_fs)
+        max_pos = int(1.5  * eeg_fs)
+
+        # Amplitude threshold: 25th percentile of all candidate negative peaks
+        cand_neg_peaks = []
+        for zs in neg2pos:
+            nxt = pos2neg[pos2neg > zs]
+            if len(nxt) == 0:
+                continue
+            ze = nxt[0]
+            if min_neg <= (ze - zs) <= max_neg:
+                cand_neg_peaks.append(np.min(filtered[zs:ze]))
+        if len(cand_neg_peaks) < 2:
+            continue
+        amp_thr = np.percentile(cand_neg_peaks, 25)
+
+        neg_amps, pos_amps, ptps, slopes = [], [], [], []
+        for i, zs in enumerate(neg2pos):
+            # Negative half-wave
+            ze_cands = pos2neg[pos2neg > zs]
+            if len(ze_cands) == 0:
+                continue
+            ze = ze_cands[0]
+            if not (min_neg <= (ze - zs) <= max_neg):
+                continue
+            neg_peak_val = np.min(filtered[zs:ze])
+            if neg_peak_val > amp_thr:
+                continue  # not deep enough
+
+            # Positive half-wave
+            zp_cands = neg2pos[neg2pos > ze]
+            if len(zp_cands) == 0:
+                continue
+            zp = zp_cands[0]
+            if not (min_pos <= (zp - ze) <= max_pos):
+                continue
+            pos_peak_val = np.max(filtered[ze:zp])
+            ptp_val      = pos_peak_val - neg_peak_val
+
+            # Rising slope: from negative trough to positive peak
+            neg_pk_idx = zs + int(np.argmin(filtered[zs:ze]))
+            pos_pk_idx = ze + int(np.argmax(filtered[ze:zp]))
+            dur_s = (pos_pk_idx - neg_pk_idx) / eeg_fs
+            slope_val = ptp_val / (dur_s + 1e-6)
+
+            neg_amps.append(abs(neg_peak_val))
+            pos_amps.append(pos_peak_val)
+            ptps.append(ptp_val)
+            slopes.append(slope_val)
+
+        if len(neg_amps) > 0:
+            base = ch_idx * 5
+            out[base + 0] = len(neg_amps) / nrem_min   # density / min
+            out[base + 1] = float(np.mean(neg_amps))   # mean |neg| amplitude
+            out[base + 2] = float(np.mean(pos_amps))   # mean pos amplitude
+            out[base + 3] = float(np.mean(ptps))       # mean peak-to-peak
+            out[base + 4] = float(np.mean(slopes))     # mean rising slope
+
     return out
 
 
