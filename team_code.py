@@ -102,6 +102,14 @@ PS_SCALAR_COLS = ['brain_health_score', 'total_cognition_score',
 N_PS_FEATS     = len(PS_SCALAR_COLS) + PS_N_PCA   # 4 scalars + 50 PCA = 54
 # Hand-crafted vector from extract_all_features (before CNN & PS stack).
 N_BASE_FEATURES = 319
+# Optional ablation of base columns (indices before CNN/PS) — cross-site robustness.
+# Env ABLATE_BLOCKS: comma list among T, remrat, sfar, spin (see _ABLATE_SLICES).
+_ABLATE_SLICES = {
+    'T':      (307, 319),  # [T] half-night spectral (12)
+    'remrat': (295, 304),  # [Q] REM spectral ratios (9)
+    'sfar':   (304, 307),  # [R] REM slow/fast (3)
+    'spin':   (134, 152),  # [G] custom spindles (18) — strong; use sparingly
+}
 
 # ── 1D-CNN raw-EEG embedding (hybrid A-plan: CNN emb + tree classifier) ─────
 CNN_INPUT_LEN = int(os.environ.get('CNN_INPUT_LEN', '8192'))
@@ -119,6 +127,27 @@ LOSO_OBJECTIVE  = os.environ.get('LOSO_OBJECTIVE', 'blend').strip().lower()
 # Equalize total sample weight per SiteID so majority sites do not dominate trees/CNN.
 BALANCE_SITE_WEIGHT = os.environ.get('BALANCE_SITE_WEIGHT', '1') != '0'
 USE_DUAL_LGBM   = os.environ.get('USE_DUAL_LGBM', '0') == '1'
+# Final predictor: trees = LGBM(+dual)+XGB (default); mlp = MLP only; hybrid = average prob.
+CLASSIFIER_MODE = os.environ.get('CLASSIFIER', 'trees').strip().lower()
+
+
+def _parse_ablate_blocks():
+    raw = os.environ.get('ABLATE_BLOCKS', '').strip()
+    if not raw:
+        return []
+    out = []
+    for part in raw.split(','):
+        key = part.strip().upper()
+        if key in _ABLATE_SLICES:
+            out.append(key)
+    return out
+
+
+def _zero_ablate_base_columns(X_arr, ablate_ids):
+    """Zero selected base-feature columns (0..N_BASE_FEATURES-1). In-place."""
+    for bid in ablate_ids:
+        lo, hi = _ABLATE_SLICES[bid]
+        X_arr[:, lo:hi] = 0.0
 
 
 def _make_train_cv_splitter(site_arr, y_arr, verbose=False):
@@ -617,6 +646,12 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
     # site→label shortcuts that won't generalise to unseen validation sites.
     X_arr[:, 10:13] = 0.0
 
+    _ablate = _parse_ablate_blocks()
+    if _ablate:
+        _zero_ablate_base_columns(X_arr, _ablate)
+        if verbose:
+            print(f'[ABLATE] zeroed base blocks (cross-site experiment): {_ablate}')
+
     # Site-normalise absolute EEG features to remove hardware/electrode bias:
     #   [C] EEG bandpower log1p (25-114): absolute PSD varies by amplifier/impedance
     #   [G] spindle amplitude/power (134-151): YASA absolute values
@@ -862,17 +897,45 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
     if final_xgb is not None:
         final_xgb.fit(X_sel, y_arr, sample_weight=sample_weight)
 
+    cmode = CLASSIFIER_MODE if CLASSIFIER_MODE in ('trees', 'mlp', 'hybrid') else 'trees'
+    final_mlp, mlp_scaler = None, None
+    if cmode in ('mlp', 'hybrid'):
+        from sklearn.preprocessing import StandardScaler
+        from sklearn.neural_network import MLPClassifier
+        mlp_scaler = StandardScaler()
+        X_mlp = mlp_scaler.fit_transform(X_sel)
+        bs = min(64, max(16, len(y_arr) // 10))
+        final_mlp = MLPClassifier(
+            hidden_layer_sizes=(256, 128),
+            activation='relu',
+            solver='adam',
+            alpha=1e-3,
+            batch_size=bs,
+            max_iter=1200,
+            early_stopping=True,
+            validation_fraction=0.15,
+            n_iter_no_change=30,
+            random_state=42,
+        )
+        final_mlp.fit(X_mlp, y_arr, sample_weight=sample_weight)
+        if verbose:
+            print(f'[train] MLPClassifier fitted | classifier_mode={cmode}')
+
     joblib.dump({
-        'stack':           final_lgbm,
-        'stack_b':         final_lgbm_b,
-        'xgb_model':       final_xgb,
-        'cnn_state':       cnn_state,
-        'cnn_input_len':   CNN_INPUT_LEN,
-        'feat_mask':       feat_mask,
-        'feature_version': FEATURE_VERSION,
-        'site_norm':       _site_norm,
-        'site_norm_idx':   _SNORM_IDX,
-        'ps_pca':          ps_pca,          # PCA fitted on PS latents (may be None)
+        'stack':            final_lgbm,
+        'stack_b':          final_lgbm_b,
+        'xgb_model':        final_xgb,
+        'mlp_model':        final_mlp,
+        'mlp_scaler':       mlp_scaler,
+        'classifier_mode':  cmode,
+        'ablate_blocks':    _ablate,
+        'cnn_state':        cnn_state,
+        'cnn_input_len':    CNN_INPUT_LEN,
+        'feat_mask':        feat_mask,
+        'feature_version':  FEATURE_VERSION,
+        'site_norm':        _site_norm,
+        'site_norm_idx':    _SNORM_IDX,
+        'ps_pca':           ps_pca,          # PCA fitted on PS latents (may be None)
     }, _model_path_for_save(model_folder))
 
     if verbose:
@@ -917,6 +980,11 @@ def run_model(model, record, data_folder, verbose):
     X[0, 220:295] = 0.0   # coherence
     X[0, 10:13]   = 0.0   # site one-hot
 
+    for bid in (model.get('ablate_blocks') or []):
+        if bid in _ABLATE_SLICES:
+            lo, hi = _ABLATE_SLICES[bid]
+            X[0, lo:hi] = 0.0
+
     # Apply site-level normalisation to EEG amplitude features
     _snorm = model.get('site_norm')
     _sidx  = model.get('site_norm_idx')
@@ -928,15 +996,31 @@ def run_model(model, record, data_folder, verbose):
     if feat_mask is not None:
         X = X[:, feat_mask]
 
-    prob = float(lgbm_model.predict_proba(X)[0][1])
-    if lgbm_model_b is not None:
-        prob = (prob + float(lgbm_model_b.predict_proba(X)[0][1])) / 2.0
-    if xgb_model is not None:
-        px = float(xgb_model.predict_proba(X)[0][1])
+    cmode = (model.get('classifier_mode') or 'trees').lower()
+    mlp_m  = model.get('mlp_model')
+    mlp_sc = model.get('mlp_scaler')
+
+    def _tree_prob():
+        p = float(lgbm_model.predict_proba(X)[0][1])
         if lgbm_model_b is not None:
-            prob = (2.0 * prob + px) / 3.0
-        else:
-            prob = (prob + px) / 2.0
+            p = (p + float(lgbm_model_b.predict_proba(X)[0][1])) / 2.0
+        if xgb_model is not None:
+            px = float(xgb_model.predict_proba(X)[0][1])
+            if lgbm_model_b is not None:
+                p = (2.0 * p + px) / 3.0
+            else:
+                p = (p + px) / 2.0
+        return p
+
+    if cmode == 'mlp' and mlp_m is not None and mlp_sc is not None:
+        Xm = mlp_sc.transform(X)
+        prob = float(mlp_m.predict_proba(Xm)[0][1])
+    elif cmode == 'hybrid' and mlp_m is not None and mlp_sc is not None:
+        Xm = mlp_sc.transform(X)
+        pm = float(mlp_m.predict_proba(Xm)[0][1])
+        prob = (_tree_prob() + pm) / 2.0
+    else:
+        prob = _tree_prob()
 
     binary = prob >= 0.5
     return binary, prob
