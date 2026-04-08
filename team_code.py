@@ -116,6 +116,8 @@ CNN_INPUT_LEN = int(os.environ.get('CNN_INPUT_LEN', '8192'))
 CNN_EMB_DIM   = int(os.environ.get('CNN_EMB_DIM', '32'))
 CNN_EPOCHS    = int(os.environ.get('CNN_EPOCHS', '40'))
 CNN_LR        = float(os.environ.get('CNN_LR', '0.001'))
+# Optuna trials for LGBM/fs_pct (default 80; lower for smoke tests, e.g. OPTUNA_N_TRIALS=3)
+OPTUNA_N_TRIALS = max(1, int(os.environ.get('OPTUNA_N_TRIALS', '80')))
 
 # ── Robustness experiment toggles (override via env vars) ───────────────────
 # Optuna LOSO objective:
@@ -693,7 +695,7 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
             from sklearn.metrics import roc_auc_score as _roc
             optuna.logging.set_verbosity(optuna.logging.WARNING)
             if verbose:
-                print(f'[Optuna] LOSO objective={LOSO_OBJECTIVE!r} | '
+                print(f'[Optuna] n_trials={OPTUNA_N_TRIALS} | LOSO objective={LOSO_OBJECTIVE!r} | '
                       f'LOSO_MIN_WEIGHT={LOSO_MIN_WEIGHT} | '
                       f'site balance={"on" if BALANCE_SITE_WEIGHT else "off"}')
 
@@ -756,7 +758,7 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
                 direction='maximize',
                 sampler=optuna.samplers.TPESampler(seed=42),
             )
-            study.optimize(_lgbm_objective, n_trials=80,
+            study.optimize(_lgbm_objective, n_trials=OPTUNA_N_TRIALS,
                            show_progress_bar=verbose)
             _best_lgbm_params = {k: v for k, v in study.best_params.items()
                                   if k != 'fs_pct'}
