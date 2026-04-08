@@ -917,7 +917,8 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV):
             n_iter_no_change=30,
             random_state=42,
         )
-        final_mlp.fit(X_mlp, y_arr, sample_weight=sample_weight)
+        # MLPClassifier has no sample_weight in sklearn<=1.6; trees still use weights.
+        final_mlp.fit(X_mlp, y_arr)
         if verbose:
             print(f'[train] MLPClassifier fitted | classifier_mode={cmode}')
 
